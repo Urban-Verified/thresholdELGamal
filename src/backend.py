@@ -114,7 +114,11 @@ def create_backend_app(keyper_urls):
         n, t = state["n"], state["t"]
         urls = state["keyper_urls"][:n]
 
-        # --- Round 1: collect commitments and shares from all keypers ---
+        # Build keyper URL map: {keyper_id: url}
+        keyper_url_map = {idx + 1: url for idx, url in enumerate(urls)}
+
+        # --- Round 1: each keyper generates polynomial + commitments ---
+        # Backend receives ONLY commitments (public). Shares stay with keypers.
         round1_data = {}
         for idx, url in enumerate(urls):
             kid = idx + 1
@@ -143,19 +147,26 @@ def create_backend_app(keyper_urls):
             all_commitments_dicts[kid] = comms_dicts
             all_commitments_points[kid] = comms_points
 
-        # --- Round 2: distribute shares and verify ---
+        # --- Share distribution: keypers send shares directly to each other ---
+        # Backend tells each keyper the URLs of all other keypers.
+        # Each keyper sends its secret shares peer-to-peer (backend never sees them).
+        for idx, url in enumerate(urls):
+            kid = idx + 1
+            try:
+                resp = requests.post(f"{url}/dkg/distribute_shares", json={
+                    "keyper_urls": {str(k): v for k, v in keyper_url_map.items()},
+                }, timeout=60)
+                resp.raise_for_status()
+            except Exception as e:
+                return jsonify({"error": f"DKG share distribution failed for keyper {kid}: {e}"}), 500
+
+        # --- Round 2: send commitments (public) and trigger verification ---
         mpk_shares = {}
         for idx, url in enumerate(urls):
             kid = idx + 1
-            # Gather shares intended for this keyper from all dealers
-            received_shares = {}
-            for dealer_id, d in round1_data.items():
-                received_shares[str(dealer_id)] = d["shares"][str(kid)]
-
             try:
                 resp = requests.post(f"{url}/dkg/round2", json={
                     "all_commitments": {str(k): v for k, v in all_commitments_dicts.items()},
-                    "received_shares": received_shares,
                 }, timeout=30)
                 resp.raise_for_status()
                 r2 = resp.json()
@@ -329,7 +340,8 @@ def create_backend_app(keyper_urls):
             valid_shares = []
             for kr in keyper_responses:
                 kid = int(kr["keyper_id"])
-                mpk_k = dict_to_point(kr["public_key_share"])
+                # Use the MPK share established during DKG, NOT the self-reported one
+                mpk_k = state["mpk_shares"][kid]
                 share_data = kr["shares"][j]
                 sigma = dict_to_point(share_data["sigma"])
                 proof_e = int(share_data["proof"]["e"])

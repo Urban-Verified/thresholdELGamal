@@ -163,7 +163,7 @@ def prove_exact_budget(mpk, sum_C1, sum_C2, B, r_sum, election_id=""):
     a1 = point_multiply(G2, w)   # w · P₂
     a2 = point_multiply(mpk, w)  # w · mpk
 
-    hash_args = [sum_C1, D, a1, a2]
+    hash_args = [G2, mpk, sum_C1, D, a1, a2]
     if election_id:
         hash_args.append(election_id)
     e = hash_to_scalar(*hash_args, domain=_DOMAIN_BUDGET)
@@ -186,7 +186,7 @@ def verify_exact_budget(mpk, sum_C1, sum_C2, B, proof, election_id=""):
     # a₂ = z·mpk - e·D
     a2 = point_add(point_multiply(mpk, z), point_neg(point_multiply(D, e)))
 
-    hash_args = [sum_C1, D, a1, a2]
+    hash_args = [G2, mpk, sum_C1, D, a1, a2]
     if election_id:
         hash_args.append(election_id)
     e_check = hash_to_scalar(*hash_args, domain=_DOMAIN_BUDGET)

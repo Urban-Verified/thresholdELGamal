@@ -140,6 +140,9 @@ def dict_to_point(d):
     # Validate point is on the curve by checking it's in G2
     if not bls.is_on_curve(P, bls.b2):
         raise ValueError("Point is not on the G2 curve")
+    # Subgroup check: P must have order CURVE_ORDER (cofactor attack protection)
+    if not bls.eq(bls.multiply(P, CURVE_ORDER), Z2):
+        raise ValueError("Point is not in the G2 prime-order subgroup")
     return P
 
 
