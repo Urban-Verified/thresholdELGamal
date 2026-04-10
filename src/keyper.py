@@ -6,6 +6,8 @@ Each keyper runs as an independent HTTP server and participates in:
   1. Distributed Key Generation (DKG) — generates secret share, verifies others' shares
   2. Partial Decryption — computes decryption shares with DLEQ correctness proofs
 
+All operations use BLS12-381 G2.
+
 Usage:
     python keyper.py --id 1 --port 5001
     python keyper.py --id 2 --port 5002
@@ -17,6 +19,7 @@ import json
 import sys
 from flask import Flask, request, jsonify
 
+from crypto.primitives import point_to_dict, dict_to_point
 from crypto.dkg import KeyperDKGState
 from crypto.proofs import prove_decryption_share
 
@@ -32,26 +35,23 @@ def create_keyper_app(keyper_id):
         return jsonify({
             "keyper_id": keyper_meta["id"],
             "dkg_completed": dkg_state.combined_share is not None,
-            "public_key_share": str(dkg_state.public_key_share) if dkg_state.public_key_share else None,
+            "public_key_share": point_to_dict(dkg_state.public_key_share) if dkg_state.public_key_share else None,
         })
 
     @app.route("/dkg/round1", methods=["POST"])
     def dkg_round1():
         """DKG Round 1: Generate secret, polynomial, commitments, and shares."""
         data = request.get_json()
-        p = int(data["p"])
-        q = int(data["q"])
-        g = int(data["g"])
         n = int(data["n"])
         t = int(data["t"])
         kid = int(data["keyper_id"])
         keyper_meta["id"] = kid
 
-        commitments, shares = dkg_state.round1(kid, p, q, g, n, t)
+        commitments, shares = dkg_state.round1(kid, n, t)
 
         return jsonify({
             "keyper_id": kid,
-            "commitments": [str(c) for c in commitments],
+            "commitments": [point_to_dict(c) for c in commitments],
             "shares": {str(k): str(v) for k, v in shares.items()},
         })
 
@@ -60,12 +60,12 @@ def create_keyper_app(keyper_id):
         """DKG Round 2: Verify received shares and compute combined secret share."""
         data = request.get_json()
 
-        # Parse commitments: {dealer_id_str: [commitment_str, ...]}
+        # Parse commitments: {dealer_id_str: [G2 point dicts, ...]}
         all_commitments = {}
         for dealer_id_str, comms in data["all_commitments"].items():
-            all_commitments[int(dealer_id_str)] = [int(c) for c in comms]
+            all_commitments[int(dealer_id_str)] = [dict_to_point(c) for c in comms]
 
-        # Parse received shares: {dealer_id_str: share_str}
+        # Parse received shares: {dealer_id_str: share_str (scalar)}
         received_shares = {}
         for dealer_id_str, share in data["received_shares"].items():
             received_shares[int(dealer_id_str)] = int(share)
@@ -77,7 +77,7 @@ def create_keyper_app(keyper_id):
 
         return jsonify({
             "keyper_id": keyper_meta["id"],
-            "public_key_share": str(public_key_share),
+            "public_key_share": point_to_dict(public_key_share),
             "verified": True,
         })
 
@@ -85,29 +85,26 @@ def create_keyper_app(keyper_id):
     def decrypt():
         """Compute partial decryption shares with DLEQ proofs for each candidate."""
         data = request.get_json()
-        ciphertexts_c1 = [int(c) for c in data["ciphertexts_c1"]]
+        ciphertexts_c1 = [dict_to_point(c) for c in data["ciphertexts_c1"]]
 
         if dkg_state.combined_share is None:
             return jsonify({"error": "DKG not completed"}), 400
 
-        p = dkg_state.p
-        q = dkg_state.q
-        g = dkg_state.g
         msk_k = dkg_state.combined_share
         mpk_k = dkg_state.public_key_share
 
         results = []
         for c1 in ciphertexts_c1:
             sigma = dkg_state.partial_decrypt(c1)
-            proof_e, proof_z = prove_decryption_share(p, q, g, c1, msk_k, mpk_k, sigma)
+            proof_e, proof_z = prove_decryption_share(c1, msk_k, mpk_k, sigma)
             results.append({
-                "sigma": str(sigma),
+                "sigma": point_to_dict(sigma),
                 "proof": {"e": str(proof_e), "z": str(proof_z)},
             })
 
         return jsonify({
             "keyper_id": keyper_meta["id"],
-            "public_key_share": str(mpk_k),
+            "public_key_share": point_to_dict(mpk_k),
             "shares": results,
         })
 

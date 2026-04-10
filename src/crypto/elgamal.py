@@ -1,102 +1,133 @@
 """
-Linear homomorphic ElGamal encryption in the exponent.
+Linear homomorphic ElGamal encryption in the exponent over BLS12-381 G2.
 
-Encrypt(m) = (g^r, pk^r * g^m) where r is random.
-Homomorphic: Enc(m1) * Enc(m2) = Enc(m1 + m2).
-Decryption requires solving DLog for small m (baby-step-giant-step).
+Encrypt(m) = (r·P₂, r·mpk + m·P₂) where r is random.
+Homomorphic: Enc(m₁) + Enc(m₂) = Enc(m₁ + m₂) (point-wise addition).
+Decryption requires solving DLog for small m (baby-step-giant-step on EC).
 """
 
-import secrets
 import math
+from .primitives import (
+    G2, Z2, CURVE_ORDER,
+    point_multiply, point_add, point_neg, point_eq, is_identity,
+    random_scalar,
+)
 
 
-def encrypt(p, q, g, pk, m):
-    """ElGamal encryption in the exponent.
+def encrypt(mpk, m):
+    """ElGamal encryption in the exponent over G2.
 
-    Returns (c1, c2, r) where:
-      c1 = g^r mod p
-      c2 = pk^r * g^m mod p
-      r  = encryption randomness (needed for ZK proofs)
+    Args:
+        mpk: election public key (G2 point)
+        m: message (integer, must be small for decryption)
+
+    Returns (C1, C2, r) where:
+        C1 = r · P₂           (G2 point)
+        C2 = r · mpk + m · P₂ (G2 point)
+        r  = encryption randomness (scalar, needed for ZK proofs)
     """
-    r = secrets.randbelow(q - 1) + 1  # uniform in [1, q-1]
-    c1 = pow(g, r, p)
-    c2 = (pow(pk, r, p) * pow(g, m, p)) % p
-    return c1, c2, r
+    r = random_scalar()
+    C1 = point_multiply(G2, r)
+    C2 = point_add(point_multiply(mpk, r), point_multiply(G2, m))
+    return C1, C2, r
 
 
-def homomorphic_add(ct_a, ct_b, p):
-    """Homomorphically add two ciphertexts (component-wise multiplication)."""
-    return (ct_a[0] * ct_b[0]) % p, (ct_a[1] * ct_b[1]) % p
+def homomorphic_add(ct_a, ct_b):
+    """Homomorphically add two ciphertexts (point-wise EC addition)."""
+    return (point_add(ct_a[0], ct_b[0]), point_add(ct_a[1], ct_b[1]))
 
 
-def aggregate_ciphertexts(ciphertexts, p):
+def aggregate_ciphertexts(ciphertexts):
     """Aggregate a list of ciphertexts homomorphically."""
-    result = (1, 1)  # identity: encrypts 0 with r=0
+    result = (Z2, Z2)  # identity: encrypts 0 with r=0
     for ct in ciphertexts:
-        result = homomorphic_add(result, ct, p)
+        result = homomorphic_add(result, ct)
     return result
 
 
-def baby_step_giant_step(g, target, p, max_val):
-    """Find m in [0, max_val] such that g^m = target mod p.
+def baby_step_giant_step(target, max_val):
+    """Find m in [0, max_val] such that m·P₂ = target (G2 point).
 
     Uses baby-step-giant-step algorithm: O(sqrt(max_val)) time and space.
     Returns m or None if not found.
     """
     if max_val == 0:
-        return 0 if target % p == 1 else None
+        return 0 if is_identity(target) else None
+
+    if is_identity(target):
+        return 0
+
+    from py_ecc.optimized_bls12_381 import optimized_curve as bls
 
     n = int(math.isqrt(max_val)) + 2
 
-    # Baby steps: table[g^j mod p] = j for j = 0, ..., n-1
+    # Baby steps: table[normalize(j·P₂)] = j for j = 0, ..., n-1
     table = {}
-    power = 1
+    power = Z2
     for j in range(n):
-        table[power] = j
-        power = (power * g) % p
+        if is_identity(power):
+            key = "Z2"
+        else:
+            norm = bls.normalize(power)
+            key = (str(norm[0].coeffs), str(norm[1].coeffs))
+        table[key] = j
+        power = point_add(power, G2)
 
-    # Giant steps: check target * g^(-in) for i = 0, 1, ...
-    g_neg_n = pow(g, -n, p)
+    # Giant steps: check target - i*n*P₂ for i = 0, 1, ...
+    neg_step = point_neg(point_multiply(G2, n))
     gamma = target
     for i in range(n + 1):
-        if gamma in table:
-            m = i * n + table[gamma]
+        if is_identity(gamma):
+            key = "Z2"
+        else:
+            norm = bls.normalize(gamma)
+            key = (str(norm[0].coeffs), str(norm[1].coeffs))
+        if key in table:
+            m = i * n + table[key]
             if m <= max_val:
                 return m
-        gamma = (gamma * g_neg_n) % p
+        gamma = point_add(gamma, neg_step)
 
     return None
 
 
-def combine_decryption_shares(shares, p, q):
-    """Combine partial decryption shares via Lagrange interpolation in the exponent.
+def lagrange_coefficient(j_id, all_ids, q):
+    """Compute Lagrange coefficient λ_j for index j_id at x=0.
 
-    shares: list of (keyper_id, sigma_i) where sigma_i = C1^msk_i
-    Returns combined sigma = C1^msk
+    λ_j = Π_{k≠j} (0 - k) / (j - k)  mod q
     """
-    result = 1
-    for j_idx, (j_id, sigma_j) in enumerate(shares):
-        # Lagrange coefficient for j_id evaluated at x=0
-        lam_num = 1
-        lam_den = 1
-        for k_idx, (k_id, _) in enumerate(shares):
-            if k_idx == j_idx:
-                continue
-            lam_num = (lam_num * (0 - k_id)) % q
-            lam_den = (lam_den * (j_id - k_id)) % q
-        lam = (lam_num * pow(lam_den, -1, q)) % q
-        result = (result * pow(sigma_j, lam, p)) % p
+    lam_num = 1
+    lam_den = 1
+    for k_id in all_ids:
+        if k_id == j_id:
+            continue
+        lam_num = (lam_num * (0 - k_id)) % q
+        lam_den = (lam_den * (j_id - k_id)) % q
+    return (lam_num * pow(lam_den, -1, q)) % q
+
+
+def combine_decryption_shares(shares):
+    """Combine partial decryption shares via Lagrange interpolation on EC.
+
+    shares: list of (keyper_id, sigma_i) where sigma_i = msk_i · C₁ (G2 point)
+    Returns combined sigma = msk · C₁ (G2 point)
+    """
+    all_ids = [kid for kid, _ in shares]
+    result = Z2
+    for j_id, sigma_j in shares:
+        lam = lagrange_coefficient(j_id, all_ids, CURVE_ORDER)
+        result = point_add(result, point_multiply(sigma_j, lam))
     return result
 
 
-def threshold_decrypt(c1, c2, shares, p, q, g, max_val):
+def threshold_decrypt(C1, C2, shares, max_val):
     """Full threshold decryption.
 
-    c1, c2: ciphertext components
-    shares: list of (keyper_id, sigma_i) decryption shares
+    C1, C2: ciphertext components (G2 points)
+    shares: list of (keyper_id, sigma_i) decryption shares (G2 points)
     max_val: upper bound on plaintext for BSGS
     Returns plaintext m or None if decryption fails.
     """
-    sigma = combine_decryption_shares(shares, p, q)
-    tau = (c2 * pow(sigma, -1, p)) % p  # tau = g^m
-    return baby_step_giant_step(g, tau, p, max_val)
+    sigma = combine_decryption_shares(shares)
+    tau = point_add(C2, point_neg(sigma))  # tau = m · P₂
+    return baby_step_giant_step(tau, max_val)

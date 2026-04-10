@@ -1,23 +1,31 @@
 """
-Non-interactive Zero-Knowledge Proofs for the threshold ElGamal voting system.
+Non-interactive Zero-Knowledge Proofs for the threshold ElGamal voting system
+over BLS12-381 G2.
 
 Implements three proof types (all Fiat-Shamir transformed):
 
 1. Range Proof (Vote Validity):
    Proves a ciphertext encrypts a value in {0, 1, ..., B} using a
    (B+1)-branch OR-composition of DLEQ proofs.
+   Spec §6.1.1: For each possible value mᵢ, define Dᵢ = C₂ - mᵢ·P₂.
+   Real branch: a₁ = w·P₂, a₂ = w·mpk.
+   Simulated: a₁ = zᵢ·P₂ - eᵢ·C₁, a₂ = zᵢ·mpk - eᵢ·Dᵢ.
 
 2. Budget Proof (Exact Budget):
    Proves the sum of encrypted votes equals exactly B using a DLEQ proof
    on the homomorphically aggregated ciphertext.
+   Spec §6.1.3: D = (c_Σ)₂ - B·P₂ = r_Σ·mpk. Prove log_{P₂}(c_Σ₁) = log_{mpk}(D).
 
 3. Decryption Share Proof:
-   Proves a partial decryption share sigma_k = C1^msk_k is correctly formed,
-   i.e., log_g(mpk_k) = log_C1(sigma_k), using a DLEQ proof.
+   Proves a partial decryption share σₖ = mskₖ·C₁ is correctly formed.
+   Spec §6.3: Prove log_{P₂}(mpkₖ) = log_{C₁}(σₖ).
 """
 
-import secrets
-from .primitives import hash_to_int
+from .primitives import (
+    G2, Z2, CURVE_ORDER,
+    point_multiply, point_add, point_neg, point_eq,
+    hash_to_scalar, random_scalar,
+)
 
 # Domain separation tags for Fiat-Shamir hashes
 _DOMAIN_RANGE = b"THRESHOLD_ELGAMAL_RANGE_PROOF_V1"
@@ -26,197 +34,210 @@ _DOMAIN_DECRYPT = b"THRESHOLD_ELGAMAL_DECRYPT_PROOF_V1"
 
 
 # ---------------------------------------------------------------------------
-#  1. Range Proof: v ∈ {0, 1, ..., B}
+#  1. Range Proof: v ∈ {0, 1, ..., B}   (Spec §6.1.1)
 # ---------------------------------------------------------------------------
 
-def prove_range(p, q, g, pk, c1, c2, m, r, B, election_id=""):
-    """Prove that ciphertext (c1, c2) encrypts m ∈ {0, 1, ..., B}.
+def prove_range(mpk, C1, C2, m, r, B, election_id=""):
+    """Prove that ciphertext (C1, C2) encrypts m ∈ {0, 1, ..., B}.
 
     Uses a (B+1)-branch OR-composition of DLEQ proofs.
-    For each possible value i, define D_i = c2 * g^(-i).
-    If m == i (real branch): the prover knows r such that c1 = g^r and D_i = pk^r.
+    For each possible value i, define Dᵢ = C₂ - i·P₂.
+    If m == i (real branch): the prover knows r such that C₁ = r·P₂ and Dᵢ = r·mpk.
     If m != i (simulated branch): the prover simulates a DLEQ proof.
 
     Args:
-        p, q, g: group parameters
-        pk: election public key (mpk)
-        c1, c2: ciphertext components
+        mpk: election public key (G2 point)
+        C1, C2: ciphertext components (G2 points)
         m: actual encrypted value (0 <= m <= B)
-        r: encryption randomness
+        r: encryption randomness (scalar)
         B: upper bound of allowed range
         election_id: optional election identifier bound into the proof
 
     Returns:
-        List of (e_i, z_i) tuples for i = 0..B.
+        List of (eᵢ, zᵢ) tuples for i = 0..B.
     """
     assert 0 <= m <= B, f"Message {m} not in range [0, {B}]"
 
-    # D_i = c2 * g^(-i) mod p for each possible value i
-    D = [(c2 * pow(g, -i, p)) % p for i in range(B + 1)]
+    # Dᵢ = C₂ - i·P₂ for each possible value i
+    D = [point_add(C2, point_neg(point_multiply(G2, i))) for i in range(B + 1)]
 
     # Generate commitments for each branch
-    a_values = [None] * (B + 1)
+    a_values = [None] * (B + 1)  # (a₁ᵢ, a₂ᵢ) G2 points
     challenges = [None] * (B + 1)
     responses = [None] * (B + 1)
 
     # Real branch: random commitment
-    w = secrets.randbelow(q - 1) + 1
-    a_values[m] = (pow(g, w, p), pow(pk, w, p))
+    w = random_scalar()
+    a_values[m] = (point_multiply(G2, w), point_multiply(mpk, w))
 
     # Simulated branches: random challenge and response, derive commitments
     for i in range(B + 1):
         if i == m:
             continue
-        e_i = secrets.randbelow(q - 1) + 1
-        z_i = secrets.randbelow(q - 1) + 1
-        a1 = (pow(g, z_i, p) * pow(c1, -e_i, p)) % p
-        a2 = (pow(pk, z_i, p) * pow(D[i], -e_i, p)) % p
+        e_i = random_scalar()
+        z_i = random_scalar()
+        # a₁ᵢ = zᵢ·P₂ - eᵢ·C₁
+        a1 = point_add(point_multiply(G2, z_i), point_neg(point_multiply(C1, e_i)))
+        # a₂ᵢ = zᵢ·mpk - eᵢ·Dᵢ
+        a2 = point_add(point_multiply(mpk, z_i), point_neg(point_multiply(D[i], e_i)))
         a_values[i] = (a1, a2)
         challenges[i] = e_i
         responses[i] = z_i
 
-    # Fiat-Shamir challenge: hash with domain separation and election context
-    hash_args = [g, pk, c1, c2]
+    # Fiat-Shamir challenge: H(P₂, mpk, C₁, C₂, {a₁ᵢ, a₂ᵢ}, election_id)
+    hash_args = [G2, mpk, C1, C2]
     for a1, a2 in a_values:
         hash_args.extend([a1, a2])
     if election_id:
         hash_args.append(election_id)
-    e = hash_to_int(*hash_args, domain=_DOMAIN_RANGE) % q
+    e = hash_to_scalar(*hash_args, domain=_DOMAIN_RANGE)
 
     # Real branch: compute challenge and response
-    e_sum_sim = sum(c for c in challenges if c is not None) % q
-    e_real = (e - e_sum_sim) % q
-    z_real = (w + r * e_real) % q
+    e_sum_sim = sum(c for c in challenges if c is not None) % CURVE_ORDER
+    e_real = (e - e_sum_sim) % CURVE_ORDER
+    z_real = (w + r * e_real) % CURVE_ORDER
     challenges[m] = e_real
     responses[m] = z_real
 
     return list(zip(challenges, responses))
 
 
-def verify_range(p, q, g, pk, c1, c2, proof, B, election_id=""):
-    """Verify a range proof that (c1, c2) encrypts a value in {0, ..., B}.
+def verify_range(mpk, C1, C2, proof, B, election_id=""):
+    """Verify a range proof that (C1, C2) encrypts a value in {0, ..., B}.
 
-    For each branch i, recomputes commitments from (e_i, z_i) and checks
-    that the sum of challenges equals the Fiat-Shamir hash.
+    Spec §6.1.2: For each branch i, recompute commitments and check
+    that Σeᵢ ≡ e' (mod q).
 
     Returns True if the proof is valid.
     """
     if len(proof) != B + 1:
         return False
 
-    D = [(c2 * pow(g, -i, p)) % p for i in range(B + 1)]
+    D = [point_add(C2, point_neg(point_multiply(G2, i))) for i in range(B + 1)]
 
     a_values = []
     e_sum = 0
     for i in range(B + 1):
         e_i, z_i = proof[i]
-        a1 = (pow(g, z_i, p) * pow(c1, -e_i, p)) % p
-        a2 = (pow(pk, z_i, p) * pow(D[i], -e_i, p)) % p
+        # a₁ᵢ = zᵢ·P₂ - eᵢ·C₁
+        a1 = point_add(point_multiply(G2, z_i), point_neg(point_multiply(C1, e_i)))
+        # a₂ᵢ = zᵢ·mpk - eᵢ·Dᵢ
+        a2 = point_add(point_multiply(mpk, z_i), point_neg(point_multiply(D[i], e_i)))
         a_values.append((a1, a2))
-        e_sum = (e_sum + e_i) % q
+        e_sum = (e_sum + e_i) % CURVE_ORDER
 
-    hash_args = [g, pk, c1, c2]
+    hash_args = [G2, mpk, C1, C2]
     for a1, a2 in a_values:
         hash_args.extend([a1, a2])
     if election_id:
         hash_args.append(election_id)
-    e_expected = hash_to_int(*hash_args, domain=_DOMAIN_RANGE) % q
+    e_expected = hash_to_scalar(*hash_args, domain=_DOMAIN_RANGE)
 
     return e_sum == e_expected
 
 
 # ---------------------------------------------------------------------------
-#  2. Budget Proof: sum(v_j) = B exactly
+#  2. Budget Proof: Σvⱼ = B exactly   (Spec §6.1.3)
 # ---------------------------------------------------------------------------
 
-def prove_exact_budget(p, q, g, pk, sum_c1, sum_c2, B, r_sum, election_id=""):
+def prove_exact_budget(mpk, sum_C1, sum_C2, B, r_sum, election_id=""):
     """Prove that the aggregated ciphertext encrypts exactly B.
 
-    This is a DLEQ proof showing log_g(sum_c1) = log_pk(D) = r_sum,
-    where D = sum_c2 * g^(-B). If the sum of votes equals B, then
-    D = pk^r_sum.
+    This is a DLEQ proof showing log_{P₂}(sum_C1) = log_{mpk}(D) = r_sum,
+    where D = sum_C2 - B·P₂. If the sum of votes equals B, then D = r_sum·mpk.
 
     Args:
-        p, q, g: group parameters
-        pk: election public key
-        sum_c1, sum_c2: homomorphically aggregated ciphertext
+        mpk: election public key (G2 point)
+        sum_C1, sum_C2: homomorphically aggregated ciphertext (G2 points)
         B: exact budget value
-        r_sum: sum of all encryption randomness values
+        r_sum: sum of all encryption randomness values (scalar)
         election_id: optional election identifier bound into the proof
 
     Returns:
         Tuple (e, z) constituting the DLEQ proof.
     """
-    D = (sum_c2 * pow(g, -B, p)) % p
+    # D = sum_C2 - B·P₂
+    D = point_add(sum_C2, point_neg(point_multiply(G2, B)))
 
-    w = secrets.randbelow(q - 1) + 1
-    a1 = pow(g, w, p)
-    a2 = pow(pk, w, p)
+    w = random_scalar()
+    a1 = point_multiply(G2, w)   # w · P₂
+    a2 = point_multiply(mpk, w)  # w · mpk
 
-    hash_args = [sum_c1, D, a1, a2]
+    hash_args = [sum_C1, D, a1, a2]
     if election_id:
         hash_args.append(election_id)
-    e = hash_to_int(*hash_args, domain=_DOMAIN_BUDGET) % q
-    z = (w + r_sum * e) % q
+    e = hash_to_scalar(*hash_args, domain=_DOMAIN_BUDGET)
+    z = (w + r_sum * e) % CURVE_ORDER
 
     return (e, z)
 
 
-def verify_exact_budget(p, q, g, pk, sum_c1, sum_c2, B, proof, election_id=""):
+def verify_exact_budget(mpk, sum_C1, sum_C2, B, proof, election_id=""):
     """Verify an exact budget proof.
 
     Recomputes the DLEQ commitments and checks the Fiat-Shamir hash.
     Returns True if the proof is valid.
     """
     e, z = proof
-    D = (sum_c2 * pow(g, -B, p)) % p
+    D = point_add(sum_C2, point_neg(point_multiply(G2, B)))
 
-    a1 = (pow(g, z, p) * pow(sum_c1, -e, p)) % p
-    a2 = (pow(pk, z, p) * pow(D, -e, p)) % p
+    # a₁ = z·P₂ - e·sum_C1
+    a1 = point_add(point_multiply(G2, z), point_neg(point_multiply(sum_C1, e)))
+    # a₂ = z·mpk - e·D
+    a2 = point_add(point_multiply(mpk, z), point_neg(point_multiply(D, e)))
 
-    hash_args = [sum_c1, D, a1, a2]
+    hash_args = [sum_C1, D, a1, a2]
     if election_id:
         hash_args.append(election_id)
-    e_check = hash_to_int(*hash_args, domain=_DOMAIN_BUDGET) % q
+    e_check = hash_to_scalar(*hash_args, domain=_DOMAIN_BUDGET)
     return e == e_check
 
 
 # ---------------------------------------------------------------------------
-#  3. Decryption Share Proof: log_g(mpk_k) = log_C1(sigma_k)
+#  3. Decryption Share Proof: log_{P₂}(mpkₖ) = log_{C₁}(σₖ)   (Spec §6.3)
 # ---------------------------------------------------------------------------
 
-def prove_decryption_share(p, q, g, c1, msk_k, mpk_k, sigma_k):
-    """Prove correct partial decryption: sigma_k = c1^msk_k.
+def prove_decryption_share(C1, msk_k, mpk_k, sigma_k):
+    """Prove correct partial decryption: σₖ = mskₖ · C₁.
 
-    This is a DLEQ proof showing that the same secret key msk_k was used
-    to form both mpk_k = g^msk_k and sigma_k = c1^msk_k.
+    This is a DLEQ proof showing that the same secret key mskₖ was used
+    to form both mpkₖ = mskₖ·P₂ and σₖ = mskₖ·C₁.
+
+    Spec §6.3:
+      a₁ = w·P₂, a₂ = w·C₁
+      e = H(mpkₖ, σₖ, a₁, a₂)
+      z = w + mskₖ·e mod q
 
     Returns:
         Tuple (e, z) constituting the DLEQ proof.
     """
-    w = secrets.randbelow(q - 1) + 1
-    a1 = pow(g, w, p)
-    a2 = pow(c1, w, p)
+    w = random_scalar()
+    a1 = point_multiply(G2, w)   # w · P₂
+    a2 = point_multiply(C1, w)   # w · C₁
 
-    e = hash_to_int(g, c1, mpk_k, sigma_k, a1, a2, domain=_DOMAIN_DECRYPT) % q
-    z = (w + msk_k * e) % q
+    e = hash_to_scalar(mpk_k, sigma_k, a1, a2, domain=_DOMAIN_DECRYPT)
+    z = (w + msk_k * e) % CURVE_ORDER
 
     return (e, z)
 
 
-def verify_decryption_share(p, q, g, c1, mpk_k, sigma_k, proof):
+def verify_decryption_share(C1, mpk_k, sigma_k, proof):
     """Verify a decryption share proof.
 
-    Checks that log_g(mpk_k) = log_c1(sigma_k) using the provided DLEQ proof.
+    Spec §6.3 verification:
+      a₁' = z·P₂ - e·mpkₖ
+      a₂' = z·C₁ - e·σₖ
+      e' = H(mpkₖ, σₖ, a₁', a₂')
+      Accept iff e' == e.
+
     Returns True if the proof is valid.
     """
     e, z = proof
 
-    a1 = (pow(g, z, p) * pow(mpk_k, -e, p)) % p
-    a2 = (pow(c1, z, p) * pow(sigma_k, -e, p)) % p
+    # a₁' = z·P₂ - e·mpkₖ
+    a1 = point_add(point_multiply(G2, z), point_neg(point_multiply(mpk_k, e)))
+    # a₂' = z·C₁ - e·σₖ
+    a2 = point_add(point_multiply(C1, z), point_neg(point_multiply(sigma_k, e)))
 
-    e_check = hash_to_int(g, c1, mpk_k, sigma_k, a1, a2, domain=_DOMAIN_DECRYPT) % q
-    return e == e_check
-
-    e_check = hash_to_int(mpk_k, sigma_k, a1, a2) % q
+    e_check = hash_to_scalar(mpk_k, sigma_k, a1, a2, domain=_DOMAIN_DECRYPT)
     return e == e_check

@@ -3,11 +3,13 @@
 Election Backend Server — Manages elections, coordinates DKG, receives votes,
 performs homomorphic aggregation, and orchestrates threshold decryption.
 
+All cryptographic operations use BLS12-381 G2.
+
 Usage:
     python backend.py --port 5000 --keyper-urls http://127.0.0.1:5001,http://127.0.0.1:5002,http://127.0.0.1:5003
 
 Endpoints:
-    POST /election/create           Create a new election (generates group params)
+    POST /election/create           Create a new election
     POST /election/dkg              Run DKG across all registered keypers
     GET  /election/params           Get election public parameters
     POST /election/vote             Submit an encrypted vote with ZK proofs
@@ -23,7 +25,11 @@ import threading
 import requests
 from flask import Flask, request, jsonify
 
-from crypto.primitives import generate_group_params, validate_group_element
+from crypto.primitives import (
+    CURVE_ORDER, G2, Z2,
+    point_to_dict, dict_to_point, validate_g2_point,
+    point_add, point_eq, is_identity,
+)
 from crypto.elgamal import aggregate_ciphertexts, threshold_decrypt
 from crypto.proofs import verify_range, verify_exact_budget, verify_decryption_share
 
@@ -35,18 +41,15 @@ def create_backend_app(keyper_urls):
     # Election state (protected by lock for thread safety)
     state = {
         "phase": "idle",  # idle -> setup -> voting -> tallying -> done
-        "p": None,
-        "q": None,
-        "g": None,
-        "mpk": None,
-        "mpk_shares": {},  # {keyper_id: mpk_k}
+        "mpk": None,       # G2 point
+        "mpk_shares": {},  # {keyper_id: G2 point}
         "num_candidates": 0,
         "budget": 1,
         "candidate_names": [],
         "n": 0,  # number of keypers
         "t": 0,  # threshold (polynomial degree; need t+1 for decryption)
         "keyper_urls": list(keyper_urls),
-        "ballots": [],  # list of validated ballots (per-candidate ciphertexts)
+        "ballots": [],  # list of validated ballots (per-candidate ciphertexts as G2 point pairs)
         "result": None,
         "lock": threading.Lock(),
     }
@@ -61,7 +64,6 @@ def create_backend_app(keyper_urls):
         t = int(data.get("t", n // 2))
         num_candidates = int(data.get("num_candidates", 3))
         budget = int(data.get("budget", 1))
-        bits = int(data.get("bits", 256))
         candidate_names = data.get("candidate_names", [f"Candidate_{i}" for i in range(num_candidates)])
 
         if n < 1:
@@ -73,14 +75,9 @@ def create_backend_app(keyper_urls):
         if len(state["keyper_urls"]) < n:
             return jsonify({"error": f"Only {len(state['keyper_urls'])} keyper URLs registered, need {n}"}), 400
 
-        p, q, g = generate_group_params(bits)
-
         with state["lock"]:
             state.update({
                 "phase": "setup",
-                "p": p,
-                "q": q,
-                "g": g,
                 "mpk": None,
                 "mpk_shares": {},
                 "num_candidates": num_candidates,
@@ -95,9 +92,9 @@ def create_backend_app(keyper_urls):
         return jsonify({
             "status": "ok",
             "phase": "setup",
-            "p": str(p),
-            "q": str(q),
-            "g": str(g),
+            "curve": "BLS12-381",
+            "group": "G2",
+            "curve_order": str(CURVE_ORDER),
             "n": n,
             "t": t,
             "num_candidates": num_candidates,
@@ -114,7 +111,6 @@ def create_backend_app(keyper_urls):
             if state["phase"] != "setup":
                 return jsonify({"error": f"Cannot run DKG in phase '{state['phase']}'"}), 400
 
-        p, q, g = state["p"], state["q"], state["g"]
         n, t = state["n"], state["t"]
         urls = state["keyper_urls"][:n]
 
@@ -124,7 +120,6 @@ def create_backend_app(keyper_urls):
             kid = idx + 1
             try:
                 resp = requests.post(f"{url}/dkg/round1", json={
-                    "p": str(p), "q": str(q), "g": str(g),
                     "n": n, "t": t, "keyper_id": kid,
                 }, timeout=30)
                 resp.raise_for_status()
@@ -132,16 +127,21 @@ def create_backend_app(keyper_urls):
             except Exception as e:
                 return jsonify({"error": f"DKG Round 1 failed for keyper {kid}: {e}"}), 500
 
-        # Collect all commitments and validate group membership
-        all_commitments = {}
+        # Collect all commitments and validate G2 group membership
+        all_commitments_dicts = {}  # raw JSON dicts for forwarding
+        all_commitments_points = {}  # parsed G2 points for validation
         for kid, d in round1_data.items():
-            comms = [int(c) for c in d["commitments"]]
-            for c in comms:
+            comms_dicts = d["commitments"]
+            comms_points = []
+            for c_dict in comms_dicts:
                 try:
-                    validate_group_element(c, p, q)
+                    pt = dict_to_point(c_dict)
+                    validate_g2_point(pt)
+                    comms_points.append(pt)
                 except ValueError as e:
                     return jsonify({"error": f"Invalid DKG commitment from keyper {kid}: {e}"}), 500
-            all_commitments[kid] = comms
+            all_commitments_dicts[kid] = comms_dicts
+            all_commitments_points[kid] = comms_points
 
         # --- Round 2: distribute shares and verify ---
         mpk_shares = {}
@@ -154,22 +154,22 @@ def create_backend_app(keyper_urls):
 
             try:
                 resp = requests.post(f"{url}/dkg/round2", json={
-                    "all_commitments": {str(k): v for k, v in all_commitments.items()},
+                    "all_commitments": {str(k): v for k, v in all_commitments_dicts.items()},
                     "received_shares": received_shares,
                 }, timeout=30)
                 resp.raise_for_status()
                 r2 = resp.json()
                 if not r2.get("verified"):
                     return jsonify({"error": f"Keyper {kid} failed share verification"}), 500
-                mpk_shares[kid] = int(r2["public_key_share"])
+                mpk_shares[kid] = dict_to_point(r2["public_key_share"])
             except Exception as e:
                 return jsonify({"error": f"DKG Round 2 failed for keyper {kid}: {e}"}), 500
 
-        # Compute master public key: product of all gamma_0 values
-        mpk = 1
+        # Compute master public key: sum of all γ₀ values (EC point addition)
+        mpk = Z2
         for kid in range(1, n + 1):
-            gamma_0 = all_commitments[kid][0]
-            mpk = (mpk * gamma_0) % p
+            gamma_0 = all_commitments_points[kid][0]
+            mpk = point_add(mpk, gamma_0)
 
         with state["lock"]:
             state["mpk"] = mpk
@@ -179,8 +179,8 @@ def create_backend_app(keyper_urls):
         return jsonify({
             "status": "ok",
             "phase": "voting",
-            "mpk": str(mpk),
-            "mpk_shares": {str(k): str(v) for k, v in mpk_shares.items()},
+            "mpk": point_to_dict(mpk),
+            "mpk_shares": {str(k): point_to_dict(v) for k, v in mpk_shares.items()},
         })
 
     # ------------------------------------------------------------------
@@ -190,10 +190,10 @@ def create_backend_app(keyper_urls):
     def get_params():
         return jsonify({
             "phase": state["phase"],
-            "p": str(state["p"]) if state["p"] else None,
-            "q": str(state["q"]) if state["q"] else None,
-            "g": str(state["g"]) if state["g"] else None,
-            "mpk": str(state["mpk"]) if state["mpk"] else None,
+            "curve": "BLS12-381",
+            "group": "G2",
+            "curve_order": str(CURVE_ORDER),
+            "mpk": point_to_dict(state["mpk"]) if state["mpk"] else None,
             "num_candidates": state["num_candidates"],
             "budget": state["budget"],
             "candidate_names": state["candidate_names"],
@@ -211,28 +211,27 @@ def create_backend_app(keyper_urls):
                 return jsonify({"error": f"Not accepting votes in phase '{state['phase']}'"}), 400
 
         data = request.get_json()
-        p, q, g = state["p"], state["q"], state["g"]
         mpk = state["mpk"]
         B = state["budget"]
         num_cand = state["num_candidates"]
 
-        # Parse ciphertexts
+        # Parse ciphertexts (pairs of G2 points)
         cts_raw = data.get("ciphertexts", [])
         if len(cts_raw) != num_cand:
             return jsonify({"error": f"Expected {num_cand} ciphertexts, got {len(cts_raw)}"}), 400
 
         ciphertexts = []
         for ct in cts_raw:
-            c1, c2 = int(ct["c1"]), int(ct["c2"])
-            # Validate ciphertext group membership
             try:
-                validate_group_element(c1, p, q)
-                validate_group_element(c2, p, q)
-            except ValueError as e:
+                c1 = dict_to_point(ct["c1"])
+                c2 = dict_to_point(ct["c2"])
+                validate_g2_point(c1)
+                validate_g2_point(c2)
+            except (ValueError, KeyError) as e:
                 return jsonify({"error": f"Invalid ciphertext: {e}"}), 400
             ciphertexts.append((c1, c2))
 
-        # Parse range proofs
+        # Parse range proofs (list of (e, z) scalar pairs)
         range_proofs_raw = data.get("range_proofs", [])
         if len(range_proofs_raw) != num_cand:
             return jsonify({"error": f"Expected {num_cand} range proofs"}), 400
@@ -242,19 +241,19 @@ def create_backend_app(keyper_urls):
             proof = [(int(branch["e"]), int(branch["z"])) for branch in proof_list]
             range_proofs.append(proof)
 
-        # Parse budget proof
+        # Parse budget proof (e, z) scalar pair
         bp_raw = data.get("budget_proof", {})
         budget_proof = (int(bp_raw["e"]), int(bp_raw["z"]))
 
         # --- Verify range proofs ---
         for j in range(num_cand):
             c1, c2 = ciphertexts[j]
-            if not verify_range(p, q, g, mpk, c1, c2, range_proofs[j], B):
+            if not verify_range(mpk, c1, c2, range_proofs[j], B):
                 return jsonify({"error": f"Range proof for candidate {j} is invalid"}), 400
 
         # --- Verify budget proof ---
-        sum_ct = aggregate_ciphertexts(ciphertexts, p)
-        if not verify_exact_budget(p, q, g, mpk, sum_ct[0], sum_ct[1], B, budget_proof):
+        sum_ct = aggregate_ciphertexts(ciphertexts)
+        if not verify_exact_budget(mpk, sum_ct[0], sum_ct[1], B, budget_proof):
             return jsonify({"error": "Budget proof is invalid"}), 400
 
         # Store validated ballot
@@ -278,7 +277,6 @@ def create_backend_app(keyper_urls):
                 return jsonify({"error": f"Cannot tally in phase '{state['phase']}'"}), 400
             state["phase"] = "tallying"
 
-        p, q, g = state["p"], state["q"], state["g"]
         mpk = state["mpk"]
         n, t = state["n"], state["t"]
         num_cand = state["num_candidates"]
@@ -295,10 +293,11 @@ def create_backend_app(keyper_urls):
         aggregated = []
         for j in range(num_cand):
             candidate_cts = [(ballot[j][0], ballot[j][1]) for ballot in ballots]
-            agg = aggregate_ciphertexts(candidate_cts, p)
+            agg = aggregate_ciphertexts(candidate_cts)
             aggregated.append(agg)
 
-        agg_c1s = [str(agg[0]) for agg in aggregated]
+        # Serialize aggregated C1 values for keypers
+        agg_c1_dicts = [point_to_dict(agg[0]) for agg in aggregated]
 
         # --- Request decryption shares from all keypers ---
         keyper_responses = []
@@ -306,7 +305,7 @@ def create_backend_app(keyper_urls):
             kid = idx + 1
             try:
                 resp = requests.post(f"{url}/decrypt", json={
-                    "ciphertexts_c1": agg_c1s,
+                    "ciphertexts_c1": agg_c1_dicts,
                 }, timeout=60)
                 resp.raise_for_status()
                 keyper_responses.append(resp.json())
@@ -330,13 +329,13 @@ def create_backend_app(keyper_urls):
             valid_shares = []
             for kr in keyper_responses:
                 kid = int(kr["keyper_id"])
-                mpk_k = int(kr["public_key_share"])
+                mpk_k = dict_to_point(kr["public_key_share"])
                 share_data = kr["shares"][j]
-                sigma = int(share_data["sigma"])
+                sigma = dict_to_point(share_data["sigma"])
                 proof_e = int(share_data["proof"]["e"])
                 proof_z = int(share_data["proof"]["z"])
 
-                if verify_decryption_share(p, q, g, c1_j, mpk_k, sigma, (proof_e, proof_z)):
+                if verify_decryption_share(c1_j, mpk_k, sigma, (proof_e, proof_z)):
                     valid_shares.append((kid, sigma))
                 else:
                     print(f"[Backend] Warning: Invalid decryption proof from keyper {kid} for candidate {j}")
@@ -351,7 +350,7 @@ def create_backend_app(keyper_urls):
 
             # Use exactly t+1 shares for decryption
             used_shares = valid_shares[:t + 1]
-            tally_j = threshold_decrypt(c1_j, c2_j, used_shares, p, q, g, max_val)
+            tally_j = threshold_decrypt(c1_j, c2_j, used_shares, max_val)
 
             if tally_j is None:
                 with state["lock"]:
@@ -414,7 +413,6 @@ def create_backend_app(keyper_urls):
         with state["lock"]:
             state.update({
                 "phase": "idle",
-                "p": None, "q": None, "g": None,
                 "mpk": None, "mpk_shares": {},
                 "num_candidates": 0, "budget": 1,
                 "candidate_names": [],

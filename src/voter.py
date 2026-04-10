@@ -2,8 +2,8 @@
 """
 Voter CLI — Encrypts votes client-side and submits them to the election backend.
 
-All cryptographic operations (encryption, ZK proof generation) happen locally.
-The backend never sees plaintext votes.
+All cryptographic operations (encryption, ZK proof generation) happen locally
+using BLS12-381 G2. The backend never sees plaintext votes.
 
 Usage:
     # Get election parameters
@@ -24,6 +24,7 @@ import json
 import sys
 import requests
 
+from crypto.primitives import CURVE_ORDER, dict_to_point, point_to_dict
 from crypto.elgamal import encrypt, aggregate_ciphertexts
 from crypto.proofs import prove_range, prove_exact_budget
 
@@ -46,10 +47,7 @@ def cast_vote(backend_url, vote_vector):
         print(f"Error: Election is in phase '{params['phase']}', not accepting votes.")
         return False
 
-    p = int(params["p"])
-    q = int(params["q"])
-    g = int(params["g"])
-    mpk = int(params["mpk"])
+    mpk = dict_to_point(params["mpk"])
     num_candidates = params["num_candidates"]
     B = params["budget"]
     candidate_names = params["candidate_names"]
@@ -72,26 +70,26 @@ def cast_vote(backend_url, vote_vector):
     ciphertexts = []
     randomness = []
     for j in range(num_candidates):
-        c1, c2, r = encrypt(p, q, g, mpk, vote_vector[j])
-        ciphertexts.append((c1, c2))
+        C1, C2, r = encrypt(mpk, vote_vector[j])
+        ciphertexts.append((C1, C2))
         randomness.append(r)
 
     # --- Generate range proofs ---
     range_proofs = []
     for j in range(num_candidates):
-        c1, c2 = ciphertexts[j]
-        proof = prove_range(p, q, g, mpk, c1, c2, vote_vector[j], randomness[j], B)
+        C1, C2 = ciphertexts[j]
+        proof = prove_range(mpk, C1, C2, vote_vector[j], randomness[j], B)
         range_proofs.append(proof)
 
     # --- Generate budget proof ---
-    sum_ct = aggregate_ciphertexts(ciphertexts, p)
-    r_sum = sum(randomness) % q
-    budget_proof = prove_exact_budget(p, q, g, mpk, sum_ct[0], sum_ct[1], B, r_sum)
+    sum_ct = aggregate_ciphertexts(ciphertexts)
+    r_sum = sum(randomness) % CURVE_ORDER
+    budget_proof = prove_exact_budget(mpk, sum_ct[0], sum_ct[1], B, r_sum)
 
     # --- Serialize and submit ---
     payload = {
         "ciphertexts": [
-            {"c1": str(ct[0]), "c2": str(ct[1])} for ct in ciphertexts
+            {"c1": point_to_dict(ct[0]), "c2": point_to_dict(ct[1])} for ct in ciphertexts
         ],
         "range_proofs": [
             [{"e": str(e), "z": str(z)} for (e, z) in proof]
@@ -115,6 +113,8 @@ def show_params(backend_url):
     """Display current election parameters."""
     params = get_election_params(backend_url)
     print(f"Phase:          {params['phase']}")
+    print(f"Curve:          {params.get('curve', 'BLS12-381')}")
+    print(f"Group:          {params.get('group', 'G2')}")
     print(f"Candidates:     {params['num_candidates']}")
     for i, name in enumerate(params.get("candidate_names", [])):
         print(f"  [{i}] {name}")
@@ -192,8 +192,6 @@ def main():
                 if args.choice < 0 or args.choice >= num_cand:
                     print(f"Error: Choice must be 0..{num_cand - 1}")
                     sys.exit(1)
-                # Single choice: 1 for selected candidate, 0 for others
-                # Only works when budget B == 1
                 if B != 1:
                     print(f"Error: --choice only works with budget=1, current budget={B}")
                     sys.exit(1)
