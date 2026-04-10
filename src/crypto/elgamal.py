@@ -6,7 +6,7 @@ Homomorphic: Enc(m1) * Enc(m2) = Enc(m1 + m2).
 Decryption requires solving DLog for small m (baby-step-giant-step).
 """
 
-import random
+import secrets
 import math
 
 
@@ -18,7 +18,7 @@ def encrypt(p, q, g, pk, m):
       c2 = pk^r * g^m mod p
       r  = encryption randomness (needed for ZK proofs)
     """
-    r = random.randrange(1, q)
+    r = secrets.randbelow(q - 1) + 1  # uniform in [1, q-1]
     c1 = pow(g, r, p)
     c2 = (pow(pk, r, p) * pow(g, m, p)) % p
     return c1, c2, r

@@ -23,7 +23,7 @@ import threading
 import requests
 from flask import Flask, request, jsonify
 
-from crypto.primitives import generate_group_params
+from crypto.primitives import generate_group_params, validate_group_element
 from crypto.elgamal import aggregate_ciphertexts, threshold_decrypt
 from crypto.proofs import verify_range, verify_exact_budget, verify_decryption_share
 
@@ -132,10 +132,16 @@ def create_backend_app(keyper_urls):
             except Exception as e:
                 return jsonify({"error": f"DKG Round 1 failed for keyper {kid}: {e}"}), 500
 
-        # Collect all commitments
+        # Collect all commitments and validate group membership
         all_commitments = {}
         for kid, d in round1_data.items():
-            all_commitments[kid] = d["commitments"]
+            comms = [int(c) for c in d["commitments"]]
+            for c in comms:
+                try:
+                    validate_group_element(c, p, q)
+                except ValueError as e:
+                    return jsonify({"error": f"Invalid DKG commitment from keyper {kid}: {e}"}), 500
+            all_commitments[kid] = comms
 
         # --- Round 2: distribute shares and verify ---
         mpk_shares = {}
@@ -162,7 +168,7 @@ def create_backend_app(keyper_urls):
         # Compute master public key: product of all gamma_0 values
         mpk = 1
         for kid in range(1, n + 1):
-            gamma_0 = int(all_commitments[kid][0])
+            gamma_0 = all_commitments[kid][0]
             mpk = (mpk * gamma_0) % p
 
         with state["lock"]:
@@ -217,7 +223,14 @@ def create_backend_app(keyper_urls):
 
         ciphertexts = []
         for ct in cts_raw:
-            ciphertexts.append((int(ct["c1"]), int(ct["c2"])))
+            c1, c2 = int(ct["c1"]), int(ct["c2"])
+            # Validate ciphertext group membership
+            try:
+                validate_group_element(c1, p, q)
+                validate_group_element(c2, p, q)
+            except ValueError as e:
+                return jsonify({"error": f"Invalid ciphertext: {e}"}), 400
+            ciphertexts.append((c1, c2))
 
         # Parse range proofs
         range_proofs_raw = data.get("range_proofs", [])

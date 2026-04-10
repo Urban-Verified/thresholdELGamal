@@ -16,15 +16,20 @@ Implements three proof types (all Fiat-Shamir transformed):
    i.e., log_g(mpk_k) = log_C1(sigma_k), using a DLEQ proof.
 """
 
-import random
+import secrets
 from .primitives import hash_to_int
+
+# Domain separation tags for Fiat-Shamir hashes
+_DOMAIN_RANGE = b"THRESHOLD_ELGAMAL_RANGE_PROOF_V1"
+_DOMAIN_BUDGET = b"THRESHOLD_ELGAMAL_BUDGET_PROOF_V1"
+_DOMAIN_DECRYPT = b"THRESHOLD_ELGAMAL_DECRYPT_PROOF_V1"
 
 
 # ---------------------------------------------------------------------------
 #  1. Range Proof: v ∈ {0, 1, ..., B}
 # ---------------------------------------------------------------------------
 
-def prove_range(p, q, g, pk, c1, c2, m, r, B):
+def prove_range(p, q, g, pk, c1, c2, m, r, B, election_id=""):
     """Prove that ciphertext (c1, c2) encrypts m ∈ {0, 1, ..., B}.
 
     Uses a (B+1)-branch OR-composition of DLEQ proofs.
@@ -39,6 +44,7 @@ def prove_range(p, q, g, pk, c1, c2, m, r, B):
         m: actual encrypted value (0 <= m <= B)
         r: encryption randomness
         B: upper bound of allowed range
+        election_id: optional election identifier bound into the proof
 
     Returns:
         List of (e_i, z_i) tuples for i = 0..B.
@@ -54,26 +60,28 @@ def prove_range(p, q, g, pk, c1, c2, m, r, B):
     responses = [None] * (B + 1)
 
     # Real branch: random commitment
-    w = random.randrange(1, q)
+    w = secrets.randbelow(q - 1) + 1
     a_values[m] = (pow(g, w, p), pow(pk, w, p))
 
     # Simulated branches: random challenge and response, derive commitments
     for i in range(B + 1):
         if i == m:
             continue
-        e_i = random.randrange(1, q)
-        z_i = random.randrange(1, q)
+        e_i = secrets.randbelow(q - 1) + 1
+        z_i = secrets.randbelow(q - 1) + 1
         a1 = (pow(g, z_i, p) * pow(c1, -e_i, p)) % p
         a2 = (pow(pk, z_i, p) * pow(D[i], -e_i, p)) % p
         a_values[i] = (a1, a2)
         challenges[i] = e_i
         responses[i] = z_i
 
-    # Fiat-Shamir challenge: hash all public values and commitments
+    # Fiat-Shamir challenge: hash with domain separation and election context
     hash_args = [g, pk, c1, c2]
     for a1, a2 in a_values:
         hash_args.extend([a1, a2])
-    e = hash_to_int(*hash_args) % q
+    if election_id:
+        hash_args.append(election_id)
+    e = hash_to_int(*hash_args, domain=_DOMAIN_RANGE) % q
 
     # Real branch: compute challenge and response
     e_sum_sim = sum(c for c in challenges if c is not None) % q
@@ -85,7 +93,7 @@ def prove_range(p, q, g, pk, c1, c2, m, r, B):
     return list(zip(challenges, responses))
 
 
-def verify_range(p, q, g, pk, c1, c2, proof, B):
+def verify_range(p, q, g, pk, c1, c2, proof, B, election_id=""):
     """Verify a range proof that (c1, c2) encrypts a value in {0, ..., B}.
 
     For each branch i, recomputes commitments from (e_i, z_i) and checks
@@ -110,7 +118,9 @@ def verify_range(p, q, g, pk, c1, c2, proof, B):
     hash_args = [g, pk, c1, c2]
     for a1, a2 in a_values:
         hash_args.extend([a1, a2])
-    e_expected = hash_to_int(*hash_args) % q
+    if election_id:
+        hash_args.append(election_id)
+    e_expected = hash_to_int(*hash_args, domain=_DOMAIN_RANGE) % q
 
     return e_sum == e_expected
 
@@ -119,7 +129,7 @@ def verify_range(p, q, g, pk, c1, c2, proof, B):
 #  2. Budget Proof: sum(v_j) = B exactly
 # ---------------------------------------------------------------------------
 
-def prove_exact_budget(p, q, g, pk, sum_c1, sum_c2, B, r_sum):
+def prove_exact_budget(p, q, g, pk, sum_c1, sum_c2, B, r_sum, election_id=""):
     """Prove that the aggregated ciphertext encrypts exactly B.
 
     This is a DLEQ proof showing log_g(sum_c1) = log_pk(D) = r_sum,
@@ -132,23 +142,27 @@ def prove_exact_budget(p, q, g, pk, sum_c1, sum_c2, B, r_sum):
         sum_c1, sum_c2: homomorphically aggregated ciphertext
         B: exact budget value
         r_sum: sum of all encryption randomness values
+        election_id: optional election identifier bound into the proof
 
     Returns:
         Tuple (e, z) constituting the DLEQ proof.
     """
     D = (sum_c2 * pow(g, -B, p)) % p
 
-    w = random.randrange(1, q)
+    w = secrets.randbelow(q - 1) + 1
     a1 = pow(g, w, p)
     a2 = pow(pk, w, p)
 
-    e = hash_to_int(sum_c1, D, a1, a2) % q
+    hash_args = [sum_c1, D, a1, a2]
+    if election_id:
+        hash_args.append(election_id)
+    e = hash_to_int(*hash_args, domain=_DOMAIN_BUDGET) % q
     z = (w + r_sum * e) % q
 
     return (e, z)
 
 
-def verify_exact_budget(p, q, g, pk, sum_c1, sum_c2, B, proof):
+def verify_exact_budget(p, q, g, pk, sum_c1, sum_c2, B, proof, election_id=""):
     """Verify an exact budget proof.
 
     Recomputes the DLEQ commitments and checks the Fiat-Shamir hash.
@@ -160,7 +174,10 @@ def verify_exact_budget(p, q, g, pk, sum_c1, sum_c2, B, proof):
     a1 = (pow(g, z, p) * pow(sum_c1, -e, p)) % p
     a2 = (pow(pk, z, p) * pow(D, -e, p)) % p
 
-    e_check = hash_to_int(sum_c1, D, a1, a2) % q
+    hash_args = [sum_c1, D, a1, a2]
+    if election_id:
+        hash_args.append(election_id)
+    e_check = hash_to_int(*hash_args, domain=_DOMAIN_BUDGET) % q
     return e == e_check
 
 
@@ -177,11 +194,11 @@ def prove_decryption_share(p, q, g, c1, msk_k, mpk_k, sigma_k):
     Returns:
         Tuple (e, z) constituting the DLEQ proof.
     """
-    w = random.randrange(1, q)
+    w = secrets.randbelow(q - 1) + 1
     a1 = pow(g, w, p)
     a2 = pow(c1, w, p)
 
-    e = hash_to_int(mpk_k, sigma_k, a1, a2) % q
+    e = hash_to_int(g, c1, mpk_k, sigma_k, a1, a2, domain=_DOMAIN_DECRYPT) % q
     z = (w + msk_k * e) % q
 
     return (e, z)
@@ -197,6 +214,9 @@ def verify_decryption_share(p, q, g, c1, mpk_k, sigma_k, proof):
 
     a1 = (pow(g, z, p) * pow(mpk_k, -e, p)) % p
     a2 = (pow(c1, z, p) * pow(sigma_k, -e, p)) % p
+
+    e_check = hash_to_int(g, c1, mpk_k, sigma_k, a1, a2, domain=_DOMAIN_DECRYPT) % q
+    return e == e_check
 
     e_check = hash_to_int(mpk_k, sigma_k, a1, a2) % q
     return e == e_check

@@ -26,7 +26,7 @@ import requests
 # Suppress Flask/werkzeug noise during tests
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-from crypto.primitives import generate_group_params, hash_to_int
+from crypto.primitives import generate_group_params, hash_to_int, validate_group_element
 from crypto.elgamal import (
     encrypt, homomorphic_add, aggregate_ciphertexts,
     baby_step_giant_step, combine_decryption_shares, threshold_decrypt,
@@ -124,6 +124,83 @@ class TestGroupParams(unittest.TestCase):
         h1 = hash_to_int(1, 2, 3)
         h2 = hash_to_int(1, 2, 4)
         self.assertNotEqual(h1, h2)
+
+    def test_hash_no_concatenation_collision(self):
+        """Length-prefixed serialization prevents H(1,23) == H(12,3)."""
+        h1 = hash_to_int(1, 23)
+        h2 = hash_to_int(12, 3)
+        self.assertNotEqual(h1, h2)
+
+    def test_hash_no_string_int_collision(self):
+        """H(123) as int != H('123') as string."""
+        h1 = hash_to_int(123)
+        h2 = hash_to_int("123")
+        self.assertNotEqual(h1, h2)
+
+    def test_hash_domain_separation(self):
+        """Different domain tags produce different hashes for same input."""
+        h1 = hash_to_int(1, 2, 3, domain=b"RANGE")
+        h2 = hash_to_int(1, 2, 3, domain=b"BUDGET")
+        self.assertNotEqual(h1, h2)
+
+    def test_hash_domain_vs_no_domain(self):
+        """Hash with domain != hash without domain."""
+        h1 = hash_to_int(1, 2, 3)
+        h2 = hash_to_int(1, 2, 3, domain=b"TAG")
+        self.assertNotEqual(h1, h2)
+
+
+class TestValidateGroupElement(unittest.TestCase):
+    """Test subgroup membership validation."""
+
+    def setUp(self):
+        self.p, self.q, self.g = get_params_256()
+
+    def test_generator_is_valid(self):
+        """Generator g passes validation."""
+        validate_group_element(self.g, self.p, self.q)  # should not raise
+
+    def test_identity_is_valid(self):
+        """1 (identity) has 1^q = 1 mod p, so it's valid."""
+        validate_group_element(1, self.p, self.q)
+
+    def test_zero_rejected(self):
+        """0 is not in Z_p*."""
+        with self.assertRaises(ValueError):
+            validate_group_element(0, self.p, self.q)
+
+    def test_p_rejected(self):
+        """p is not < p."""
+        with self.assertRaises(ValueError):
+            validate_group_element(self.p, self.p, self.q)
+
+    def test_negative_rejected(self):
+        """Negative numbers rejected."""
+        with self.assertRaises(ValueError):
+            validate_group_element(-1, self.p, self.q)
+
+    def test_non_subgroup_element_rejected(self):
+        """Element of order 2 (= p-1) is not in order-q subgroup."""
+        # p-1 has order 2 in Z_p* (since (p-1)^2 = 1 mod p)
+        # For safe prime p=2q+1, p-1 is NOT in the order-q subgroup
+        # (p-1)^q mod p = (-1)^q mod p; since q is odd prime, = p-1 != 1
+        element = self.p - 1
+        with self.assertRaises(ValueError):
+            validate_group_element(element, self.p, self.q)
+
+    def test_random_subgroup_element_valid(self):
+        """g^x is always in the subgroup."""
+        import secrets
+        x = secrets.randbelow(self.q - 1) + 1
+        elem = pow(self.g, x, self.p)
+        validate_group_element(elem, self.p, self.q)
+
+    def test_ciphertext_components_valid(self):
+        """Ciphertext from encrypt() passes validation."""
+        pk = pow(self.g, 42, self.p)
+        c1, c2, r = encrypt(self.p, self.q, self.g, pk, 5)
+        validate_group_element(c1, self.p, self.q)
+        validate_group_element(c2, self.p, self.q)
 
 
 # ======================================================================
@@ -490,6 +567,14 @@ class TestRangeProofs(unittest.TestCase):
         proof = prove_range(self.p, self.q, self.g, self.pk, c1, c2, 2, r, 5)
         self.assertEqual(len(proof), 6)
 
+    def test_election_id_binding(self):
+        """Proof with election_id='A' does not verify with election_id='B'."""
+        c1, c2, r = encrypt(self.p, self.q, self.g, self.pk, 1)
+        proof = prove_range(self.p, self.q, self.g, self.pk, c1, c2, 1, r, 1, election_id="election_A")
+        self.assertTrue(verify_range(self.p, self.q, self.g, self.pk, c1, c2, proof, 1, election_id="election_A"))
+        self.assertFalse(verify_range(self.p, self.q, self.g, self.pk, c1, c2, proof, 1, election_id="election_B"))
+        self.assertFalse(verify_range(self.p, self.q, self.g, self.pk, c1, c2, proof, 1))  # no election_id
+
 
 class TestBudgetProofs(unittest.TestCase):
     """Test ZK exact budget proofs: sum(v_j) = B."""
@@ -575,6 +660,25 @@ class TestBudgetProofs(unittest.TestCase):
         # This proof should fail because the DLEQ relation doesn't hold
         self.assertFalse(verify_exact_budget(
             self.p, self.q, self.g, self.pk, sum_ct[0], sum_ct[1], 1, proof))
+
+    def test_budget_election_id_binding(self):
+        """Budget proof with election_id='A' fails under election_id='B'."""
+        sum_ct, proof = self._make_budget_vote([1, 0], 1)
+        # Re-create with election_id
+        cts = []
+        rs = []
+        for v in [1, 0]:
+            c1, c2, r = encrypt(self.p, self.q, self.g, self.pk, v)
+            cts.append((c1, c2))
+            rs.append(r)
+        sum_ct = aggregate_ciphertexts(cts, self.p)
+        r_sum = sum(rs) % self.q
+        proof = prove_exact_budget(self.p, self.q, self.g, self.pk,
+                                   sum_ct[0], sum_ct[1], 1, r_sum, election_id="elec_A")
+        self.assertTrue(verify_exact_budget(
+            self.p, self.q, self.g, self.pk, sum_ct[0], sum_ct[1], 1, proof, election_id="elec_A"))
+        self.assertFalse(verify_exact_budget(
+            self.p, self.q, self.g, self.pk, sum_ct[0], sum_ct[1], 1, proof, election_id="elec_B"))
 
 
 class TestDecryptionShareProofs(unittest.TestCase):

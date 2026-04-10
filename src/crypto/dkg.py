@@ -14,7 +14,7 @@ Protocol:
 The master public key is mpk = product_k gamma_0^(k) = g^msk.
 """
 
-import random
+import secrets
 
 
 class KeyperDKGState:
@@ -52,7 +52,7 @@ class KeyperDKGState:
         self.t = t
 
         # Random polynomial phi(x) = c_0 + c_1*x + ... + c_t*x^t over Z_q
-        self.coefficients = [random.randrange(1, q) for _ in range(t + 1)]
+        self.coefficients = [secrets.randbelow(q - 1) + 1 for _ in range(t + 1)]
 
         # Feldman commitments: gamma_j = g^c_j mod p
         self.commitments = [pow(g, c, p) for c in self.coefficients]
