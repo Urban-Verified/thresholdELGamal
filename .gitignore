@@ -1,0 +1,44 @@
+# Reference / old implementation
+old/
+
+# Crypto protocol spec (reference only)
+cryptoprotocols/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Test / logs
+*.log
+test_logs/
+
+# Distribution
+*.whl
+*.tar.gz
