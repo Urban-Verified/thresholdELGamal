@@ -1,6 +1,6 @@
 # Threshold ElGamal Voting System
 
-A threshold ElGamal encryption-based voting system with homomorphic vote aggregation, distributed key generation, and zero-knowledge proofs.
+A threshold ElGamal encryption-based voting system over **BLS12-381** with homomorphic vote aggregation, distributed key generation, and zero-knowledge proofs.
 
 Individual votes are encrypted client-side — the backend never sees plaintext. Votes are aggregated homomorphically, and only the final tally is decrypted by a threshold committee of keypers.
 
@@ -26,23 +26,24 @@ Individual votes are encrypted client-side — the backend never sees plaintext.
 
 | Component | Implementation |
 |---|---|
-| Group | Safe prime p = 2q + 1, order-q subgroup of Z_p* |
-| Encryption | ElGamal in the exponent: C = (g^r, pk^r · g^m) |
-| Homomorphism | Component-wise multiplication: Enc(a) · Enc(b) = Enc(a+b) |
-| DKG | Feldman Verifiable Secret Sharing (2-round protocol) |
+| Curve | BLS12-381 G2 (Type-3 pairing curve, 255-bit scalar field, 128-bit security) |
+| Encryption | ElGamal in the exponent over G2: C = (r·P₂, r·mpk + m·P₂) |
+| Homomorphism | Component-wise EC point addition: Enc(a) + Enc(b) = Enc(a+b) |
+| DKG | Feldman VSS (2-round protocol, peer-to-peer share delivery) |
 | Range proofs | (B+1)-branch OR-composition of DLEQ proofs (Fiat-Shamir) |
-| Budget proofs | DLEQ proof that sum(v_j) = B on aggregated ciphertext |
-| Decryption proofs | DLEQ proof: log_g(mpk_k) = log_C1(sigma_k) |
-| DLog recovery | Baby-step giant-step for small plaintexts |
+| Budget proofs | DLEQ proof that Σvⱼ = B on aggregated ciphertext |
+| Decryption proofs | DLEQ proof: dlog_{P₂}(mpkₖ) = dlog_{C₁}(σₖ) |
+| DLog recovery | Baby-step giant-step on EC for small plaintexts |
 | RNG | `secrets` module (CSPRNG) for all key material and proof randomness |
 | Fiat-Shamir hash | SHA-256 with length-prefixed serialization and domain separation |
+| Subgroup check | Cofactor-clearing verification on all deserialized G2 points |
 
 ## Election Lifecycle
 
-1. **Create** — Backend generates safe prime group parameters.
-2. **DKG** — Backend coordinates 2-round Feldman VSS across all keypers. Each keyper gets a secret share; the joint public key mpk is published.
-3. **Voting** — Each voter encrypts their ballot client-side, generates range proofs (each vote in [0, B]) and a budget proof (sum = B), and submits to the backend. The backend validates all proofs before accepting.
-4. **Tally** — Backend homomorphically aggregates all ballots per candidate, then requests partial decryption shares (with DLEQ correctness proofs) from keypers. Only t+1 of n keypers are needed. Lagrange interpolation in the exponent recovers g^m, then BSGS recovers m.
+1. **Create** — Backend initializes election parameters for BLS12-381 G2 (no prime generation needed — curve parameters are fixed constants).
+2. **DKG** — Backend coordinates 2-round Feldman VSS. Commitments (public) flow through the backend; secret shares are distributed peer-to-peer between keypers (backend never sees them). The joint public key mpk is published.
+3. **Voting** — Each voter encrypts their ballot client-side, generates range proofs (each vote in {0, …, B}) and a budget proof (sum = B), and submits to the backend. The backend validates all proofs before accepting.
+4. **Tally** — Backend homomorphically aggregates all ballots per candidate via EC point addition, then requests partial decryption shares (with DLEQ correctness proofs) from keypers. Only t+1 of n keypers are needed. Lagrange interpolation on EC points recovers m·P₂, then BSGS recovers m.
 
 ## Quick Start
 
@@ -98,25 +99,25 @@ cd src
 python -m unittest test_comprehensive -v
 ```
 
-96 tests covering:
-- **Unit tests** — Group parameters, ElGamal encryption, homomorphic properties, BSGS, DKG (various n/t, Feldman verification, subset reconstruction), range/budget/decryption ZK proofs (completeness, soundness, tampering, domain separation, election binding), hash collision resistance, group membership validation.
-- **Integration tests** — Full crypto pipeline (DKG → encrypt → prove → aggregate → threshold decrypt) without servers.
-- **E2E tests** — Full HTTP lifecycle: single-choice elections, budget elections, invalid vote rejection, phase enforcement, election reset, 20-voter stress test, backend input validation.
+78 tests covering:
+- **Unit tests** — BLS12-381 curve constants, G2 point arithmetic, serialization/deserialization with subgroup checks, ElGamal encryption/decryption, homomorphic addition, BSGS discrete log, Lagrange coefficients, DKG (various n/t, Feldman verification, bad share rejection), range/budget/decryption ZK proofs (completeness, soundness, tampering, domain separation, election binding).
+- **Integration tests** — Full crypto pipeline (DKG → encrypt → prove → aggregate → threshold decrypt) without servers, including any-subset threshold property and decryption share proof verification.
+- **E2E tests** — Full HTTP lifecycle with peer-to-peer DKG: single-choice elections, budget elections, invalid vote rejection.
 
 ## Project Structure
 
 ```
 src/
 ├── crypto/
-│   ├── primitives.py    # Group params, Fiat-Shamir hash, group element validation
-│   ├── elgamal.py       # Encryption, homomorphic ops, BSGS, threshold decryption
-│   ├── dkg.py           # Feldman VSS distributed key generation
-│   └── proofs.py        # ZK range, budget, and decryption share proofs
+│   ├── primitives.py    # BLS12-381 G2 constants, point ops, Fiat-Shamir hash, serialization
+│   ├── elgamal.py       # EC ElGamal encryption, homomorphic ops, BSGS, threshold decryption
+│   ├── dkg.py           # Feldman VSS distributed key generation over G2
+│   └── proofs.py        # ZK range, budget, and decryption share proofs (DLEQ)
 ├── backend.py           # Election backend server (Flask)
-├── keyper.py            # Keyper server (Flask)
+├── keyper.py            # Keyper server (Flask) with P2P share delivery
 ├── voter.py             # Voter CLI
-├── test_e2e.py          # Original E2E tests (4 tests)
-├── test_comprehensive.py # Full test suite (96 tests)
+├── test_e2e.py          # Standalone E2E tests (4 tests)
+├── test_comprehensive.py # Full test suite (78 tests)
 └── requirements.txt
 ```
 
@@ -124,9 +125,9 @@ src/
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/election/create` | POST | Create election with group params |
-| `/election/dkg` | POST | Run distributed key generation |
-| `/election/params` | GET | Get public parameters (p, q, g, mpk, B, candidates) |
+| `/election/create` | POST | Create election (n, t, candidates, budget) |
+| `/election/dkg` | POST | Run distributed key generation (P2P share delivery) |
+| `/election/params` | GET | Get public parameters (curve, mpk, B, candidates, n, t) |
 | `/election/vote` | POST | Submit encrypted vote with ZK proofs |
 | `/election/tally` | POST | Aggregate and threshold-decrypt |
 | `/election/result` | GET | Get final tally |
@@ -136,27 +137,30 @@ src/
 ## Security Properties
 
 **Implemented:**
-- Ballot confidentiality (DDH assumption in order-q subgroup)
+- Ballot confidentiality (DDH assumption in G2, under SXDH — 128-bit security)
 - Threshold decryption (t+1-of-n — no single keyper can decrypt)
-- Vote validity (ZK range proofs: each vote in [0, B])
-- Budget enforcement (ZK budget proof: sum(v_j) = B)
-- Decryption correctness (DLEQ proofs on partial decryption shares)
+- Vote validity (ZK range proofs: each vote in {0, …, B})
+- Budget enforcement (ZK budget proof: Σvⱼ = B)
+- Decryption correctness (DLEQ proofs on partial decryption shares, verified against DKG-established keys)
 - Feldman VSS verification (detects dishonest keypers during DKG)
+- Peer-to-peer DKG share distribution (backend never sees secret shares)
+- G2 subgroup membership validation on all deserialized points (cofactor attack protection)
 - Ciphertext and commitment group membership validation
 - CSPRNG for all secret material (`secrets` module)
 - Fiat-Shamir hash with length-prefixed serialization (no concatenation collisions)
 - Domain separation across proof types
+- Budget proof Fiat-Shamir transcript binds P₂ and mpk per protocol spec
 - Optional election ID binding in proofs
 
 **Not implemented (requires deployment context):**
 - Voter authentication (OIDC / Keycloak)
 - Ballot signatures and replay protection
-- Transport encryption (HTTPS)
+- Transport encryption (HTTPS / TLS for P2P keyper channels)
 - Persistent storage / bulletin board
 - Voter pseudonymization
 
 ## Dependencies
 
-- **pycryptodome** — Safe prime generation, primality testing
+- **py_ecc** — BLS12-381 elliptic curve operations (optimized G2)
 - **Flask** — HTTP servers for backend and keypers
-- **requests** — HTTP client for voter CLI and backend↔keyper communication
+- **requests** — HTTP client for voter CLI, backend↔keyper coordination, and keyper↔keyper P2P share delivery
