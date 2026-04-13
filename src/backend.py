@@ -21,6 +21,7 @@ Endpoints:
 
 import argparse
 import json
+import secrets
 import threading
 import requests
 from flask import Flask, request, jsonify
@@ -28,10 +29,21 @@ from flask import Flask, request, jsonify
 from crypto.primitives import (
     CURVE_ORDER, G2, Z2,
     point_to_dict, dict_to_point, validate_g2_point,
-    point_add, point_eq, is_identity,
+    point_add, point_multiply, point_eq, is_identity,
 )
 from crypto.elgamal import aggregate_ciphertexts, threshold_decrypt
 from crypto.proofs import verify_range, verify_exact_budget, verify_decryption_share
+
+
+def _parse_scalar(value):
+    """Parse an integer from JSON and validate it is in [0, CURVE_ORDER).
+
+    Prevents DoS via astronomically large integers.
+    """
+    n = int(value)
+    if n < 0 or n >= CURVE_ORDER:
+        raise ValueError(f"Scalar {n} not in [0, CURVE_ORDER)")
+    return n
 
 
 def create_backend_app(keyper_urls):
@@ -41,6 +53,7 @@ def create_backend_app(keyper_urls):
     # Election state (protected by lock for thread safety)
     state = {
         "phase": "idle",  # idle -> setup -> voting -> tallying -> done
+        "election_id": "",  # unique identifier bound into ZK proofs
         "mpk": None,       # G2 point
         "mpk_shares": {},  # {keyper_id: G2 point}
         "num_candidates": 0,
@@ -78,6 +91,7 @@ def create_backend_app(keyper_urls):
         with state["lock"]:
             state.update({
                 "phase": "setup",
+                "election_id": secrets.token_hex(16),
                 "mpk": None,
                 "mpk_shares": {},
                 "num_candidates": num_candidates,
@@ -161,7 +175,6 @@ def create_backend_app(keyper_urls):
                 return jsonify({"error": f"DKG share distribution failed for keyper {kid}: {e}"}), 500
 
         # --- Round 2: send commitments (public) and trigger verification ---
-        mpk_shares = {}
         for idx, url in enumerate(urls):
             kid = idx + 1
             try:
@@ -172,9 +185,20 @@ def create_backend_app(keyper_urls):
                 r2 = resp.json()
                 if not r2.get("verified"):
                     return jsonify({"error": f"Keyper {kid} failed share verification"}), 500
-                mpk_shares[kid] = dict_to_point(r2["public_key_share"])
             except Exception as e:
                 return jsonify({"error": f"DKG Round 2 failed for keyper {kid}: {e}"}), 500
+
+        # Derive mpk_shares from public commitments (never trust self-reports):
+        #   mpk_j = Σ_k Σ_i (j^i mod q) · γ_i^(k)
+        mpk_shares = {}
+        for j in range(1, n + 1):
+            mpk_j = Z2
+            for dealer_kid in range(1, n + 1):
+                x_power = 1
+                for i in range(t + 1):
+                    mpk_j = point_add(mpk_j, point_multiply(all_commitments_points[dealer_kid][i], x_power))
+                    x_power = (x_power * j) % CURVE_ORDER
+            mpk_shares[j] = mpk_j
 
         # Compute master public key: sum of all γ₀ values (EC point addition)
         mpk = Z2
@@ -201,6 +225,7 @@ def create_backend_app(keyper_urls):
     def get_params():
         return jsonify({
             "phase": state["phase"],
+            "election_id": state["election_id"],
             "curve": "BLS12-381",
             "group": "G2",
             "curve_order": str(CURVE_ORDER),
@@ -225,6 +250,7 @@ def create_backend_app(keyper_urls):
         mpk = state["mpk"]
         B = state["budget"]
         num_cand = state["num_candidates"]
+        election_id = state["election_id"]
 
         # Parse ciphertexts (pairs of G2 points)
         cts_raw = data.get("ciphertexts", [])
@@ -249,22 +275,28 @@ def create_backend_app(keyper_urls):
 
         range_proofs = []
         for proof_list in range_proofs_raw:
-            proof = [(int(branch["e"]), int(branch["z"])) for branch in proof_list]
+            try:
+                proof = [(_parse_scalar(branch["e"]), _parse_scalar(branch["z"])) for branch in proof_list]
+            except (ValueError, KeyError) as e:
+                return jsonify({"error": f"Invalid proof scalar: {e}"}), 400
             range_proofs.append(proof)
 
         # Parse budget proof (e, z) scalar pair
         bp_raw = data.get("budget_proof", {})
-        budget_proof = (int(bp_raw["e"]), int(bp_raw["z"]))
+        try:
+            budget_proof = (_parse_scalar(bp_raw["e"]), _parse_scalar(bp_raw["z"]))
+        except (ValueError, KeyError) as e:
+            return jsonify({"error": f"Invalid budget proof scalar: {e}"}), 400
 
         # --- Verify range proofs ---
         for j in range(num_cand):
             c1, c2 = ciphertexts[j]
-            if not verify_range(mpk, c1, c2, range_proofs[j], B):
+            if not verify_range(mpk, c1, c2, range_proofs[j], B, election_id=election_id):
                 return jsonify({"error": f"Range proof for candidate {j} is invalid"}), 400
 
         # --- Verify budget proof ---
         sum_ct = aggregate_ciphertexts(ciphertexts)
-        if not verify_exact_budget(mpk, sum_ct[0], sum_ct[1], B, budget_proof):
+        if not verify_exact_budget(mpk, sum_ct[0], sum_ct[1], B, budget_proof, election_id=election_id):
             return jsonify({"error": "Budget proof is invalid"}), 400
 
         # Store validated ballot
@@ -338,14 +370,22 @@ def create_backend_app(keyper_urls):
             c2_j = aggregated[j][1]
 
             valid_shares = []
+            seen_kids = set()
             for kr in keyper_responses:
                 kid = int(kr["keyper_id"])
+                if kid in seen_kids:
+                    continue
+                seen_kids.add(kid)
                 # Use the MPK share established during DKG, NOT the self-reported one
                 mpk_k = state["mpk_shares"][kid]
                 share_data = kr["shares"][j]
                 sigma = dict_to_point(share_data["sigma"])
-                proof_e = int(share_data["proof"]["e"])
-                proof_z = int(share_data["proof"]["z"])
+                try:
+                    proof_e = _parse_scalar(share_data["proof"]["e"])
+                    proof_z = _parse_scalar(share_data["proof"]["z"])
+                except (ValueError, KeyError) as e:
+                    print(f"[Backend] Warning: Invalid proof scalar from keyper {kid}: {e}")
+                    continue
 
                 if verify_decryption_share(c1_j, mpk_k, sigma, (proof_e, proof_z)):
                     valid_shares.append((kid, sigma))

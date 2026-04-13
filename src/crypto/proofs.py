@@ -56,7 +56,8 @@ def prove_range(mpk, C1, C2, m, r, B, election_id=""):
     Returns:
         List of (eᵢ, zᵢ) tuples for i = 0..B.
     """
-    assert 0 <= m <= B, f"Message {m} not in range [0, {B}]"
+    if not (0 <= m <= B):
+        raise ValueError(f"Message {m} not in range [0, {B}]")
 
     # Dᵢ = C₂ - i·P₂ for each possible value i
     D = [point_add(C2, point_neg(point_multiply(G2, i))) for i in range(B + 1)]

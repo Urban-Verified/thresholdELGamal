@@ -782,6 +782,7 @@ def _submit_vote_http(backend_url, vote_vector):
     mpk = dict_to_point(params["mpk"])
     B = params["budget"]
     num_cand = params["num_candidates"]
+    election_id = params.get("election_id", "")
 
     assert len(vote_vector) == num_cand
     assert sum(vote_vector) == B
@@ -795,12 +796,12 @@ def _submit_vote_http(backend_url, vote_vector):
 
     range_proofs = []
     for j in range(num_cand):
-        proof = prove_range(mpk, cts[j][0], cts[j][1], vote_vector[j], rands[j], B)
+        proof = prove_range(mpk, cts[j][0], cts[j][1], vote_vector[j], rands[j], B, election_id=election_id)
         range_proofs.append(proof)
 
     agg = aggregate_ciphertexts(cts)
     r_sum = sum(rands) % CURVE_ORDER
-    bp = prove_exact_budget(mpk, agg[0], agg[1], B, r_sum)
+    bp = prove_exact_budget(mpk, agg[0], agg[1], B, r_sum, election_id=election_id)
 
     payload = {
         "ciphertexts": [

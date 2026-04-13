@@ -147,15 +147,17 @@ def dict_to_point(d):
 
 
 def validate_g2_point(P):
-    """Validate that P is a valid non-identity G2 point.
+    """Validate that P is a valid non-identity G2 point in the prime-order subgroup.
 
-    Checks: P is on the curve and P != identity.
+    Checks: P is on the curve, P != identity, and P has order CURVE_ORDER.
     Raises ValueError on failure.
     """
     if is_identity(P):
         raise ValueError("Point is the identity element")
     if not bls.is_on_curve(P, bls.b2):
         raise ValueError("Point is not on the G2 curve")
+    if not bls.eq(bls.multiply(P, CURVE_ORDER), Z2):
+        raise ValueError("Point is not in the G2 prime-order subgroup")
 
 
 def random_scalar():

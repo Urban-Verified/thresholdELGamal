@@ -72,6 +72,7 @@ def submit_vote(backend_url, vote_vector):
     mpk = dict_to_point(params["mpk"])
     B = params["budget"]
     num_candidates = params["num_candidates"]
+    election_id = params.get("election_id", "")
 
     assert len(vote_vector) == num_candidates, \
         f"Vote vector length {len(vote_vector)} != num_candidates {num_candidates}"
@@ -90,13 +91,13 @@ def submit_vote(backend_url, vote_vector):
     range_proofs = []
     for j in range(num_candidates):
         proof = prove_range(mpk, ciphertexts[j][0], ciphertexts[j][1],
-                            vote_vector[j], randomnesses[j], B)
+                            vote_vector[j], randomnesses[j], B, election_id=election_id)
         range_proofs.append(proof)
 
     # Budget proof: sum of votes = B
     agg = aggregate_ciphertexts(ciphertexts)
     r_sum = sum(randomnesses) % CURVE_ORDER
-    budget_proof = prove_exact_budget(mpk, agg[0], agg[1], B, r_sum)
+    budget_proof = prove_exact_budget(mpk, agg[0], agg[1], B, r_sum, election_id=election_id)
 
     # Build JSON payload
     payload = {

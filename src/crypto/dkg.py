@@ -106,6 +106,10 @@ class KeyperDKGState:
         self.combined_share = sum(received_shares.values()) % CURVE_ORDER
         self.public_key_share = point_multiply(G2, self.combined_share)
 
+        # Zeroize key material that is no longer needed
+        self.coefficients = None
+        self.shares_for_others = {}
+
         return self.combined_share, self.public_key_share
 
     def partial_decrypt(self, C1):

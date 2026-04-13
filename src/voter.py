@@ -51,6 +51,7 @@ def cast_vote(backend_url, vote_vector):
     num_candidates = params["num_candidates"]
     B = params["budget"]
     candidate_names = params["candidate_names"]
+    election_id = params.get("election_id", "")
 
     if len(vote_vector) != num_candidates:
         print(f"Error: Expected {num_candidates} vote values, got {len(vote_vector)}")
@@ -78,13 +79,13 @@ def cast_vote(backend_url, vote_vector):
     range_proofs = []
     for j in range(num_candidates):
         C1, C2 = ciphertexts[j]
-        proof = prove_range(mpk, C1, C2, vote_vector[j], randomness[j], B)
+        proof = prove_range(mpk, C1, C2, vote_vector[j], randomness[j], B, election_id=election_id)
         range_proofs.append(proof)
 
     # --- Generate budget proof ---
     sum_ct = aggregate_ciphertexts(ciphertexts)
     r_sum = sum(randomness) % CURVE_ORDER
-    budget_proof = prove_exact_budget(mpk, sum_ct[0], sum_ct[1], B, r_sum)
+    budget_proof = prove_exact_budget(mpk, sum_ct[0], sum_ct[1], B, r_sum, election_id=election_id)
 
     # --- Serialize and submit ---
     payload = {

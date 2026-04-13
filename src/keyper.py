@@ -20,7 +20,7 @@ import sys
 import requests
 from flask import Flask, request, jsonify
 
-from crypto.primitives import point_to_dict, dict_to_point
+from crypto.primitives import point_to_dict, dict_to_point, CURVE_ORDER
 from crypto.dkg import KeyperDKGState
 from crypto.proofs import prove_decryption_share
 
@@ -104,6 +104,8 @@ def create_keyper_app(keyper_id):
         data = request.get_json()
         dealer_id = int(data["dealer_id"])
         share = int(data["share"])
+        if share < 0 or share >= CURVE_ORDER:
+            return jsonify({"error": "Share value out of scalar field range"}), 400
         received_shares[dealer_id] = share
         return jsonify({"status": "ok"})
 
@@ -124,6 +126,10 @@ def create_keyper_app(keyper_id):
             combined_share, public_key_share = dkg_state.round2(all_commitments, received_shares)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
+
+        # Zeroize share material after DKG completes
+        pending_shares.clear()
+        received_shares.clear()
 
         return jsonify({
             "keyper_id": keyper_meta["id"],
