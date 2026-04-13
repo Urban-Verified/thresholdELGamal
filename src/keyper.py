@@ -125,7 +125,19 @@ def create_keyper_app(keyper_id):
         try:
             combined_share, public_key_share = dkg_state.round2(all_commitments, received_shares)
         except ValueError as e:
-            return jsonify({"error": str(e)}), 400
+            # Extract bad dealer IDs from the error message and return as complaints
+            # so the backend can identify and exclude malicious dealers
+            import re
+            match = re.search(r"dealers \[([^\]]+)\]", str(e))
+            bad_dealers = []
+            if match:
+                bad_dealers = [int(x.strip()) for x in match.group(1).split(",")]
+            return jsonify({
+                "keyper_id": keyper_meta["id"],
+                "verified": False,
+                "complaints": bad_dealers,
+                "error": str(e),
+            }), 200  # 200 so backend can parse the complaint
 
         # Zeroize share material after DKG completes
         pending_shares.clear()

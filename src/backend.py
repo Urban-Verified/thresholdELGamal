@@ -62,6 +62,7 @@ def create_backend_app(keyper_urls):
         "n": 0,  # number of keypers
         "t": 0,  # threshold (polynomial degree; need t+1 for decryption)
         "keyper_urls": list(keyper_urls),
+        "active_keypers": [],  # keyper IDs that survived DKG (after complaint exclusion)
         "ballots": [],  # list of validated ballots (per-candidate ciphertexts as G2 point pairs)
         "result": None,
         "lock": threading.Lock(),
@@ -94,6 +95,7 @@ def create_backend_app(keyper_urls):
                 "election_id": secrets.token_hex(16),
                 "mpk": None,
                 "mpk_shares": {},
+                "active_keypers": [],
                 "num_candidates": num_candidates,
                 "budget": budget,
                 "candidate_names": candidate_names[:num_candidates],
@@ -128,72 +130,112 @@ def create_backend_app(keyper_urls):
         n, t = state["n"], state["t"]
         urls = state["keyper_urls"][:n]
 
-        # Build keyper URL map: {keyper_id: url}
-        keyper_url_map = {idx + 1: url for idx, url in enumerate(urls)}
+        # Track which keyper IDs are still participating
+        active_kids = set(range(1, n + 1))
+        max_retries = n - t - 1  # maximum dealers we can exclude and still have t+1
 
-        # --- Round 1: each keyper generates polynomial + commitments ---
-        # Backend receives ONLY commitments (public). Shares stay with keypers.
-        round1_data = {}
-        for idx, url in enumerate(urls):
-            kid = idx + 1
-            try:
-                resp = requests.post(f"{url}/dkg/round1", json={
-                    "n": n, "t": t, "keyper_id": kid,
-                }, timeout=30)
-                resp.raise_for_status()
-                round1_data[kid] = resp.json()
-            except Exception as e:
-                return jsonify({"error": f"DKG Round 1 failed for keyper {kid}: {e}"}), 500
+        for attempt in range(max_retries + 1):
+            active_n = len(active_kids)
+            if active_n < t + 1:
+                return jsonify({
+                    "error": f"DKG failed: only {active_n} honest keypers remain, need at least {t + 1}",
+                }), 500
 
-        # Collect all commitments and validate G2 group membership
-        all_commitments_dicts = {}  # raw JSON dicts for forwarding
-        all_commitments_points = {}  # parsed G2 points for validation
-        for kid, d in round1_data.items():
-            comms_dicts = d["commitments"]
-            comms_points = []
-            for c_dict in comms_dicts:
+            # Build keyper URL map for active keypers only
+            keyper_url_map = {kid: urls[kid - 1] for kid in active_kids}
+
+            # --- Round 1: each keyper generates polynomial + commitments ---
+            round1_data = {}
+            for kid in sorted(active_kids):
+                url = keyper_url_map[kid]
                 try:
-                    pt = dict_to_point(c_dict)
-                    validate_g2_point(pt)
-                    comms_points.append(pt)
-                except ValueError as e:
-                    return jsonify({"error": f"Invalid DKG commitment from keyper {kid}: {e}"}), 500
-            all_commitments_dicts[kid] = comms_dicts
-            all_commitments_points[kid] = comms_points
+                    resp = requests.post(f"{url}/dkg/round1", json={
+                        "n": active_n, "t": t, "keyper_id": kid,
+                    }, timeout=30)
+                    resp.raise_for_status()
+                    round1_data[kid] = resp.json()
+                except Exception as e:
+                    return jsonify({"error": f"DKG Round 1 failed for keyper {kid}: {e}"}), 500
 
-        # --- Share distribution: keypers send shares directly to each other ---
-        # Backend tells each keyper the URLs of all other keypers.
-        # Each keyper sends its secret shares peer-to-peer (backend never sees them).
-        for idx, url in enumerate(urls):
-            kid = idx + 1
-            try:
-                resp = requests.post(f"{url}/dkg/distribute_shares", json={
-                    "keyper_urls": {str(k): v for k, v in keyper_url_map.items()},
-                }, timeout=60)
-                resp.raise_for_status()
-            except Exception as e:
-                return jsonify({"error": f"DKG share distribution failed for keyper {kid}: {e}"}), 500
+            # Collect all commitments and validate G2 group membership
+            all_commitments_dicts = {}
+            all_commitments_points = {}
+            for kid, d in round1_data.items():
+                comms_dicts = d["commitments"]
+                comms_points = []
+                for c_dict in comms_dicts:
+                    try:
+                        pt = dict_to_point(c_dict)
+                        validate_g2_point(pt)
+                        comms_points.append(pt)
+                    except ValueError as e:
+                        return jsonify({"error": f"Invalid DKG commitment from keyper {kid}: {e}"}), 500
+                all_commitments_dicts[kid] = comms_dicts
+                all_commitments_points[kid] = comms_points
 
-        # --- Round 2: send commitments (public) and trigger verification ---
-        for idx, url in enumerate(urls):
-            kid = idx + 1
-            try:
-                resp = requests.post(f"{url}/dkg/round2", json={
-                    "all_commitments": {str(k): v for k, v in all_commitments_dicts.items()},
-                }, timeout=30)
-                resp.raise_for_status()
-                r2 = resp.json()
-                if not r2.get("verified"):
-                    return jsonify({"error": f"Keyper {kid} failed share verification"}), 500
-            except Exception as e:
-                return jsonify({"error": f"DKG Round 2 failed for keyper {kid}: {e}"}), 500
+            # --- Share distribution: keypers send shares P2P ---
+            for kid in sorted(active_kids):
+                url = keyper_url_map[kid]
+                try:
+                    resp = requests.post(f"{url}/dkg/distribute_shares", json={
+                        "keyper_urls": {str(k): v for k, v in keyper_url_map.items()},
+                    }, timeout=60)
+                    resp.raise_for_status()
+                except Exception as e:
+                    return jsonify({"error": f"DKG share distribution failed for keyper {kid}: {e}"}), 500
+
+            # --- Round 2: verify shares, collect complaints ---
+            round2_results = {}
+            all_complaints = {}  # {complainer_kid: [bad_dealer_ids]}
+            for kid in sorted(active_kids):
+                url = keyper_url_map[kid]
+                try:
+                    resp = requests.post(f"{url}/dkg/round2", json={
+                        "all_commitments": {str(k): v for k, v in all_commitments_dicts.items()},
+                    }, timeout=30)
+                    resp.raise_for_status()
+                    r2 = resp.json()
+                    round2_results[kid] = r2
+                    if not r2.get("verified"):
+                        complaints = r2.get("complaints", [])
+                        if complaints:
+                            all_complaints[kid] = complaints
+                        else:
+                            return jsonify({"error": f"Keyper {kid} failed verification without complaint details"}), 500
+                except Exception as e:
+                    return jsonify({"error": f"DKG Round 2 failed for keyper {kid}: {e}"}), 500
+
+            if not all_complaints:
+                # All keypers verified successfully — DKG complete
+                break
+
+            # Identify malicious dealers: any dealer complained about by at least one honest keyper
+            bad_dealers = set()
+            for complainer, dealers in all_complaints.items():
+                for d in dealers:
+                    bad_dealers.add(d)
+
+            print(f"[Backend] DKG attempt {attempt + 1}: complaints received against dealers {bad_dealers}, retrying without them")
+            active_kids -= bad_dealers
+
+            # If we removed too many, we can't continue
+            if len(active_kids) < t + 1:
+                return jsonify({
+                    "error": f"DKG failed: only {len(active_kids)} honest keypers remain after excluding {bad_dealers}, need {t + 1}",
+                    "excluded_keypers": sorted(bad_dealers),
+                }), 500
+        else:
+            # Exhausted retries
+            return jsonify({"error": "DKG failed: too many malicious keypers, could not complete"}), 500
+
+        # --- Success path: derive keys from commitments of active keypers ---
 
         # Derive mpk_shares from public commitments (never trust self-reports):
-        #   mpk_j = Σ_k Σ_i (j^i mod q) · γ_i^(k)
+        #   mpk_j = Σ_k Σ_i (j^i mod q) · γ_i^(k)  for k in active_kids
         mpk_shares = {}
-        for j in range(1, n + 1):
+        for j in sorted(active_kids):
             mpk_j = Z2
-            for dealer_kid in range(1, n + 1):
+            for dealer_kid in sorted(active_kids):
                 x_power = 1
                 for i in range(t + 1):
                     mpk_j = point_add(mpk_j, point_multiply(all_commitments_points[dealer_kid][i], x_power))
@@ -202,13 +244,23 @@ def create_backend_app(keyper_urls):
 
         # Compute master public key: sum of all γ₀ values (EC point addition)
         mpk = Z2
-        for kid in range(1, n + 1):
+        for kid in sorted(active_kids):
             gamma_0 = all_commitments_points[kid][0]
             mpk = point_add(mpk, gamma_0)
+
+        # Validate mpk is not identity (colluding keypers could cancel contributions)
+        if is_identity(mpk):
+            return jsonify({"error": "DKG produced identity master public key — possible collusion"}), 500
+
+        # Validate each mpk_share is not identity
+        for j, mpk_j in mpk_shares.items():
+            if is_identity(mpk_j):
+                return jsonify({"error": f"DKG produced identity public key share for keyper {j}"}), 500
 
         with state["lock"]:
             state["mpk"] = mpk
             state["mpk_shares"] = mpk_shares
+            state["active_keypers"] = sorted(active_kids)
             state["phase"] = "voting"
 
         return jsonify({
@@ -325,6 +377,7 @@ def create_backend_app(keyper_urls):
         num_cand = state["num_candidates"]
         B = state["budget"]
         ballots = state["ballots"]
+        active_kids = state["active_keypers"]
         urls = state["keyper_urls"][:n]
 
         if len(ballots) == 0:
@@ -342,10 +395,10 @@ def create_backend_app(keyper_urls):
         # Serialize aggregated C1 values for keypers
         agg_c1_dicts = [point_to_dict(agg[0]) for agg in aggregated]
 
-        # --- Request decryption shares from all keypers ---
+        # --- Request decryption shares from active keypers only ---
         keyper_responses = []
-        for idx, url in enumerate(urls):
-            kid = idx + 1
+        for kid in active_kids:
+            url = urls[kid - 1]
             try:
                 resp = requests.post(f"{url}/decrypt", json={
                     "ciphertexts_c1": agg_c1_dicts,
@@ -466,6 +519,7 @@ def create_backend_app(keyper_urls):
             state.update({
                 "phase": "idle",
                 "mpk": None, "mpk_shares": {},
+                "active_keypers": [],
                 "num_candidates": 0, "budget": 1,
                 "candidate_names": [],
                 "n": 0, "t": 0,
