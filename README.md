@@ -4,6 +4,10 @@ A threshold ElGamal encryption-based voting system over **BLS12-381** with homom
 
 Individual votes are encrypted client-side — the backend never sees plaintext. Votes are aggregated homomorphically, and only the final tally is decrypted by a threshold committee of keypers.
 
+
+![Recording2026-04-13125741-ezgif com-speed](https://github.com/user-attachments/assets/12b670af-a213-44d6-a213-17170a72672c)
+
+
 ## Architecture
 
 ```
