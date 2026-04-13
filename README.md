@@ -92,6 +92,35 @@ curl -X POST http://127.0.0.1:5000/election/tally
 python voter.py result --backend http://127.0.0.1:5000
 ```
 
+### Interactive TUI (recommended)
+
+The admin TUI can launch all servers, create elections, run DKG, monitor ballots, and tally — all from one terminal:
+
+```bash
+cd src
+
+# Launch with 3 keypers (default)
+python admin_tui.py
+
+# Or customize
+python admin_tui.py --num-keypers 5 --backend-port 5000 --keyper-base-port 5001
+
+# Or point to existing servers
+python admin_tui.py --keyper-urls http://127.0.0.1:5001,http://127.0.0.1:5002,http://127.0.0.1:5003
+```
+
+From the admin menu, press `0` to spin up the backend + all keypers as background threads, then walk through the election lifecycle.
+
+The voter TUI provides an interactive voting experience with live encryption/proof visualization:
+
+```bash
+python voter_tui.py --backend http://127.0.0.1:5000
+```
+
+Features:
+- **Admin TUI** — Server management, election creation wizard, DKG visualization, live ballot monitor, tally with protocol tree, bar chart results
+- **Voter TUI** — Interactive candidate selection, live progress bars for encryption & ZK proof generation, ciphertext fingerprints, styled results display
+
 ### Run tests
 
 ```bash
@@ -116,6 +145,8 @@ src/
 ├── backend.py           # Election backend server (Flask)
 ├── keyper.py            # Keyper server (Flask) with P2P share delivery
 ├── voter.py             # Voter CLI
+├── voter_tui.py         # Interactive voter TUI (rich)
+├── admin_tui.py         # Admin TUI with server management (rich)
 ├── test_e2e.py          # Standalone E2E tests (4 tests)
 ├── test_comprehensive.py # Full test suite (78 tests)
 └── requirements.txt
@@ -164,3 +195,4 @@ src/
 - **py_ecc** — BLS12-381 elliptic curve operations (optimized G2)
 - **Flask** — HTTP servers for backend and keypers
 - **requests** — HTTP client for voter CLI, backend↔keyper coordination, and keyper↔keyper P2P share delivery
+- **rich** — Terminal UI rendering (panels, tables, progress bars, live displays)
