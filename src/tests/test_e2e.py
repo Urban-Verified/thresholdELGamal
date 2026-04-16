@@ -26,6 +26,8 @@ import logging
 # Suppress Flask/werkzeug request logging
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from keyper import create_keyper_app
 from backend import create_backend_app
 from crypto.primitives import (

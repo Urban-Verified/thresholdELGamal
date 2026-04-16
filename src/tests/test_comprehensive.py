@@ -25,6 +25,8 @@ import requests
 # Suppress Flask/werkzeug noise during tests
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from crypto.primitives import (
     CURVE_ORDER, G2, Z2, FIELD_MODULUS,
     hash_to_scalar, point_multiply, point_add, point_neg, point_eq,

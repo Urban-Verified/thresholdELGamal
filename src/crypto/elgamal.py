@@ -57,31 +57,26 @@ def baby_step_giant_step(target, max_val):
     if is_identity(target):
         return 0
 
-    from py_ecc.optimized_bls12_381 import optimized_curve as bls
-
     n = int(math.isqrt(max_val)) + 2
 
-    # Baby steps: table[normalize(j·P₂)] = j for j = 0, ..., n-1
+    def _point_key(P):
+        """Create a hashable key from a G2 point using compressed bytes."""
+        if is_identity(P):
+            return b"\x00"
+        return P.to_compressed_bytes()
+
+    # Baby steps: table[key(j·P₂)] = j for j = 0, ..., n-1
     table = {}
     power = Z2
     for j in range(n):
-        if is_identity(power):
-            key = "Z2"
-        else:
-            norm = bls.normalize(power)
-            key = (str(norm[0].coeffs), str(norm[1].coeffs))
-        table[key] = j
+        table[_point_key(power)] = j
         power = point_add(power, G2)
 
     # Giant steps: check target - i*n*P₂ for i = 0, 1, ...
     neg_step = point_neg(point_multiply(G2, n))
     gamma = target
     for i in range(n + 1):
-        if is_identity(gamma):
-            key = "Z2"
-        else:
-            norm = bls.normalize(gamma)
-            key = (str(norm[0].coeffs), str(norm[1].coeffs))
+        key = _point_key(gamma)
         if key in table:
             m = i * n + table[key]
             if m <= max_val:

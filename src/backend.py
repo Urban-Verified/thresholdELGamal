@@ -67,6 +67,7 @@ def create_backend_app(keyper_urls):
         "result": None,
         "lock": threading.Lock(),
     }
+    app._election_state = state  # expose for testing
 
     # ------------------------------------------------------------------
     #  POST /election/create

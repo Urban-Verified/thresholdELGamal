@@ -4,26 +4,31 @@ BLS12-381 G2 group primitives and hash utilities for threshold ElGamal.
 All encryption operates in G2 of BLS12-381 (Type-3 pairing curve).
 DDH is hard in G2 under the SXDH assumption.
 
-Uses py_ecc optimized BLS12-381 implementation.
+Uses py_arkworks_bls12381 (Rust/native) for fast EC operations.
 """
 
 import hashlib
 import secrets
 
-from py_ecc.optimized_bls12_381 import optimized_curve as bls
-from py_ecc.optimized_bls12_381 import optimized_curve
+from py_arkworks_bls12381 import G2Point, Scalar
 
 # BLS12-381 curve order (scalar field order)
-CURVE_ORDER = bls.curve_order
+CURVE_ORDER = 52435875175126190479447740508185965837690552500527637822603658699938581184513
+
+# Field modulus (for reference / serialization bounds)
+FIELD_MODULUS = 4002409555221667393417789825735904156556882819939007885332058136124031650490837864442687629129015664037894272559787
 
 # Generator of G2
-G2 = bls.G2
+G2 = G2Point()
 
 # Identity element in G2
-Z2 = bls.Z2
+Z2 = G2Point.identity()
 
-# Field modulus (for serialization)
-FIELD_MODULUS = bls.field_modulus
+
+def _int_to_scalar(n):
+    """Convert a Python int to an arkworks Scalar (mod CURVE_ORDER)."""
+    n = n % CURVE_ORDER
+    return Scalar(n)
 
 
 def hash_to_scalar(*args, domain=b""):
@@ -33,7 +38,7 @@ def hash_to_scalar(*args, domain=b""):
     preventing ambiguous concatenation (e.g. H(1,23) != H(12,3)).
     An optional *domain* tag isolates different proof types.
 
-    Accepts: int, bytes, str, and G2 points (tuples).
+    Accepts: int, bytes, str, and G2 points (G2Point objects).
     Returns an integer in [0, CURVE_ORDER).
     """
     h = hashlib.sha256()
@@ -45,8 +50,7 @@ def hash_to_scalar(*args, domain=b""):
             b = a.to_bytes((a.bit_length() + 8) // 8, "big", signed=True)
         elif isinstance(a, bytes):
             b = a
-        elif isinstance(a, tuple):
-            # G2 point — serialize to canonical bytes
+        elif isinstance(a, G2Point):
             b = point_to_bytes(a)
         else:
             b = str(a).encode()
@@ -61,27 +65,27 @@ def hash_to_scalar(*args, domain=b""):
 
 def point_multiply(P, scalar):
     """Scalar multiplication: scalar * P in G2."""
-    return bls.multiply(P, scalar % CURVE_ORDER)
+    return P * _int_to_scalar(scalar)
 
 
 def point_add(P, Q):
     """Point addition: P + Q in G2."""
-    return bls.add(P, Q)
+    return P + Q
 
 
 def point_neg(P):
     """Point negation: -P in G2."""
-    return bls.neg(P)
+    return -P
 
 
 def point_eq(P, Q):
     """Point equality check in G2."""
-    return bls.eq(P, Q)
+    return P == Q
 
 
 def is_identity(P):
     """Check if P is the identity (point at infinity) in G2."""
-    return bls.eq(P, Z2)
+    return P == Z2
 
 
 # ------------------------------------------------------------------
@@ -92,17 +96,12 @@ def point_to_bytes(P):
     """Serialize a G2 point to canonical bytes (uncompressed, 192 bytes for non-identity).
 
     Identity is serialized as a single zero byte.
-    Non-identity points are normalized to affine (x, y) with x, y ∈ FQ2,
-    each FQ2 having two 48-byte integer coefficients, for 4 × 48 = 192 bytes total.
+    Non-identity points are serialized as 1-byte prefix + 4 × 48-byte FQ2 coefficients.
     """
     if is_identity(P):
         return b"\x00"
-    norm = bls.normalize(P)
-    x_coeffs = norm[0].coeffs
-    y_coeffs = norm[1].coeffs
-    return b"\x01" + b"".join(
-        int(c).to_bytes(48, "big") for c in [x_coeffs[0], x_coeffs[1], y_coeffs[0], y_coeffs[1]]
-    )
+    xy = P.to_xy_bytes_be()
+    return b"\x01" + xy
 
 
 def point_to_dict(P):
@@ -113,35 +112,40 @@ def point_to_dict(P):
     """
     if is_identity(P):
         return {"identity": True}
-    norm = bls.normalize(P)
-    x_coeffs = norm[0].coeffs
-    y_coeffs = norm[1].coeffs
+    xy = P.to_xy_bytes_be()
+    # Layout: [x.c0(48) | x.c1(48) | y.c0(48) | y.c1(48)]
+    x0 = int.from_bytes(xy[0:48], "big")
+    x1 = int.from_bytes(xy[48:96], "big")
+    y0 = int.from_bytes(xy[96:144], "big")
+    y1 = int.from_bytes(xy[144:192], "big")
     return {
-        "x0": hex(int(x_coeffs[0])),
-        "x1": hex(int(x_coeffs[1])),
-        "y0": hex(int(y_coeffs[0])),
-        "y1": hex(int(y_coeffs[1])),
+        "x0": hex(x0),
+        "x1": hex(x1),
+        "y0": hex(y0),
+        "y1": hex(y1),
     }
 
 
 def dict_to_point(d):
     """Deserialize a G2 point from a JSON dict.
 
-    Raises ValueError if the point is not on the G2 curve.
+    Raises ValueError if the point is not on the G2 curve or not in the subgroup.
     """
     if d.get("identity"):
-        return Z2
-    from py_ecc.fields import optimized_bls12_381_FQ2 as FQ2
-    x = FQ2([int(d["x0"], 16), int(d["x1"], 16)])
-    y = FQ2([int(d["y0"], 16), int(d["y1"], 16)])
-    # Convert to projective coordinates (x, y, 1)
-    one = FQ2.one()
-    P = (x, y, one)
-    # Validate point is on the curve by checking it's in G2
-    if not bls.is_on_curve(P, bls.b2):
-        raise ValueError("Point is not on the G2 curve")
-    # Subgroup check: P must have order CURVE_ORDER (cofactor attack protection)
-    if not bls.eq(bls.multiply(P, CURVE_ORDER), Z2):
+        return G2Point.identity()
+    x0 = int(d["x0"], 16)
+    x1 = int(d["x1"], 16)
+    y0 = int(d["y0"], 16)
+    y1 = int(d["y1"], 16)
+    # Reconstruct xy bytes: [x.c0(48) | x.c1(48) | y.c0(48) | y.c1(48)]
+    xy = (x0.to_bytes(48, "big") + x1.to_bytes(48, "big") +
+          y0.to_bytes(48, "big") + y1.to_bytes(48, "big"))
+    try:
+        P = G2Point.from_xy_bytes_be(xy)  # validates on-curve
+    except Exception as e:
+        raise ValueError(f"Point is not on the G2 curve: {e}")
+    # Subgroup check
+    if not P.is_in_subgroup():
         raise ValueError("Point is not in the G2 prime-order subgroup")
     return P
 
@@ -149,14 +153,12 @@ def dict_to_point(d):
 def validate_g2_point(P):
     """Validate that P is a valid non-identity G2 point in the prime-order subgroup.
 
-    Checks: P is on the curve, P != identity, and P has order CURVE_ORDER.
+    Checks: P != identity and P is in the prime-order subgroup.
     Raises ValueError on failure.
     """
     if is_identity(P):
         raise ValueError("Point is the identity element")
-    if not bls.is_on_curve(P, bls.b2):
-        raise ValueError("Point is not on the G2 curve")
-    if not bls.eq(bls.multiply(P, CURVE_ORDER), Z2):
+    if not P.is_in_subgroup():
         raise ValueError("Point is not in the G2 prime-order subgroup")
 
 
