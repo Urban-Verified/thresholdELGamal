@@ -33,6 +33,7 @@ from crypto.primitives import (
 )
 from crypto.elgamal import aggregate_ciphertexts, threshold_decrypt
 from crypto.proofs import verify_range, verify_exact_budget, verify_decryption_share
+from bulletin_board import BBClient
 
 
 def _parse_scalar(value):
@@ -46,9 +47,10 @@ def _parse_scalar(value):
     return n
 
 
-def create_backend_app(keyper_urls):
+def create_backend_app(keyper_urls, bb_url):
     """Create the election backend Flask app."""
     app = Flask("election_backend")
+    bb = BBClient(bb_url)
 
     # Election state (protected by lock for thread safety)
     state = {
@@ -130,6 +132,8 @@ def create_backend_app(keyper_urls):
 
         n, t = state["n"], state["t"]
         urls = state["keyper_urls"][:n]
+        election_id = state["election_id"]
+        commit_topic = f"dkg/{election_id}/commitments"
 
         # Track which keyper IDs are still participating
         active_kids = set(range(1, n + 1))
@@ -146,23 +150,31 @@ def create_backend_app(keyper_urls):
             keyper_url_map = {kid: urls[kid - 1] for kid in active_kids}
 
             # --- Round 1: each keyper generates polynomial + commitments ---
-            round1_data = {}
+            # Keypers post commitments to the bulletin board (not to us).
             for kid in sorted(active_kids):
                 url = keyper_url_map[kid]
                 try:
                     resp = requests.post(f"{url}/dkg/round1", json={
                         "n": active_n, "t": t, "keyper_id": kid,
+                        "bb_url": bb_url,
+                        "election_id": election_id,
                     }, timeout=30)
                     resp.raise_for_status()
-                    round1_data[kid] = resp.json()
+                    r1 = resp.json()
+                    if r1.get("error"):
+                        return jsonify({"error": f"DKG Round 1 failed for keyper {kid}: {r1['error']}"}), 500
                 except Exception as e:
                     return jsonify({"error": f"DKG Round 1 failed for keyper {kid}: {e}"}), 500
 
-            # Collect all commitments and validate G2 group membership
+            # Read all commitments from the bulletin board
+            raw_entries = bb.read_topic(commit_topic)
             all_commitments_dicts = {}
             all_commitments_points = {}
-            for kid, d in round1_data.items():
-                comms_dicts = d["commitments"]
+            for kid in sorted(active_kids):
+                kid_str = str(kid)
+                if kid_str not in raw_entries:
+                    return jsonify({"error": f"Keyper {kid} did not post commitments to bulletin board"}), 500
+                comms_dicts = raw_entries[kid_str]
                 comms_points = []
                 for c_dict in comms_dicts:
                     try:
@@ -173,6 +185,9 @@ def create_backend_app(keyper_urls):
                         return jsonify({"error": f"Invalid DKG commitment from keyper {kid}: {e}"}), 500
                 all_commitments_dicts[kid] = comms_dicts
                 all_commitments_points[kid] = comms_points
+
+            # Freeze the commitment topic and get digest for cross-verification
+            commitment_digest = bb.freeze(commit_topic)
 
             # --- Share distribution: keypers send shares P2P ---
             for kid in sorted(active_kids):
@@ -186,13 +201,16 @@ def create_backend_app(keyper_urls):
                     return jsonify({"error": f"DKG share distribution failed for keyper {kid}: {e}"}), 500
 
             # --- Round 2: verify shares, collect complaints ---
+            # Keypers read commitments from the BB themselves and verify the digest.
             round2_results = {}
             all_complaints = {}  # {complainer_kid: [bad_dealer_ids]}
             for kid in sorted(active_kids):
                 url = keyper_url_map[kid]
                 try:
                     resp = requests.post(f"{url}/dkg/round2", json={
-                        "all_commitments": {str(k): v for k, v in all_commitments_dicts.items()},
+                        "bb_url": bb_url,
+                        "election_id": election_id,
+                        "expected_digest": commitment_digest,
                     }, timeout=30)
                     resp.raise_for_status()
                     r2 = resp.json()
@@ -269,6 +287,7 @@ def create_backend_app(keyper_urls):
             "phase": "voting",
             "mpk": point_to_dict(mpk),
             "mpk_shares": {str(k): point_to_dict(v) for k, v in mpk_shares.items()},
+            "commitment_digest": commitment_digest,
         })
 
     # ------------------------------------------------------------------
@@ -538,12 +557,15 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
     parser.add_argument("--keyper-urls", required=True,
                         help="Comma-separated list of keyper URLs")
+    parser.add_argument("--bb-url", required=True,
+                        help="Bulletin board server URL")
     args = parser.parse_args()
 
     keyper_urls = [u.strip() for u in args.keyper_urls.split(",")]
-    app = create_backend_app(keyper_urls)
+    app = create_backend_app(keyper_urls, args.bb_url)
     print(f"[Backend] Starting on {args.host}:{args.port}")
     print(f"[Backend] Keyper URLs: {keyper_urls}")
+    print(f"[Backend] Bulletin Board: {args.bb_url}")
     app.run(host=args.host, port=args.port, debug=False, use_reloader=False)
 
 

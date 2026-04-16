@@ -28,6 +28,7 @@ from rich import box
 
 from keyper import create_keyper_app
 from backend import create_backend_app
+from bulletin_board import create_bb_app
 
 console = Console()
 
@@ -463,7 +464,7 @@ def run_tally_tui(backend_url):
         ))
 
 
-def start_servers_tui(backend_url, keyper_urls, backend_host, backend_port, keyper_host):
+def start_servers_tui(backend_url, keyper_urls, backend_host, backend_port, keyper_host, bb_url, bb_port, bb_host):
     """Launch backend and keyper Flask servers as background threads."""
     console.print()
     console.print(Rule("[bold green]Start Servers[/]", style="green"))
@@ -484,13 +485,14 @@ def start_servers_tui(backend_url, keyper_urls, backend_host, backend_port, keyp
                  title_style="bold white")
     plan.add_column("Server", style="bold cyan")
     plan.add_column("URL", style="white")
+    plan.add_row("Bulletin Board", bb_url)
     plan.add_row("Backend", backend_url)
     for i, url in enumerate(keyper_urls):
         plan.add_row(f"Keyper {i + 1}", url)
     console.print(plan)
     console.print()
 
-    if not Confirm.ask(f"  Launch 1 backend + {len(keyper_urls)} keypers?", default=True):
+    if not Confirm.ask(f"  Launch 1 bulletin board + 1 backend + {len(keyper_urls)} keypers?", default=True):
         console.print("  [dim]Cancelled.[/]")
         return
 
@@ -508,8 +510,27 @@ def start_servers_tui(backend_url, keyper_urls, backend_host, backend_port, keyp
         TextColumn("[dim]{task.fields[detail]}[/]"),
         console=console,
     ) as progress:
-        total = 1 + len(keyper_urls)
+        total = 2 + len(keyper_urls)  # BB + backend + keypers
         task = progress.add_task("Launching servers", total=total, detail="")
+
+        # Launch bulletin board
+        label = "bulletin-board"
+        if label in _running_servers and _running_servers[label]["thread"].is_alive():
+            progress.update(task, detail="Bulletin board already running")
+            progress.advance(task)
+        else:
+            bb_app_inst = create_bb_app()
+            t = threading.Thread(
+                target=bb_app_inst.run,
+                kwargs={"host": bb_host, "port": bb_port, "debug": False, "use_reloader": False},
+                daemon=True,
+                name=label,
+            )
+            t.start()
+            _running_servers[label] = {"thread": t, "port": bb_port, "url": bb_url}
+            progress.update(task, detail=f"Bulletin board on :{bb_port}")
+            progress.advance(task)
+            time.sleep(0.3)
 
         for i, url in enumerate(keyper_urls):
             kid = i + 1
@@ -541,7 +562,7 @@ def start_servers_tui(backend_url, keyper_urls, backend_host, backend_port, keyp
             progress.update(task, detail="Backend already running")
             progress.advance(task)
         else:
-            app = create_backend_app(keyper_urls)
+            app = create_backend_app(keyper_urls, bb_url)
             t = threading.Thread(
                 target=app.run,
                 kwargs={"host": backend_host, "port": backend_port, "debug": False, "use_reloader": False},
@@ -614,7 +635,7 @@ def reset_election(backend_url):
         console.print(f"[red]  Error: {resp.json().get('error', 'Unknown')}[/]")
 
 
-def main_menu(backend_url, keyper_urls, backend_host, backend_port, keyper_host):
+def main_menu(backend_url, keyper_urls, backend_host, backend_port, keyper_host, bb_url, bb_port, bb_host):
     """Main interactive menu loop."""
     while True:
         # Show running server count in header
@@ -640,7 +661,7 @@ def main_menu(backend_url, keyper_urls, backend_host, backend_port, keyper_host)
 
         try:
             if choice == "0":
-                start_servers_tui(backend_url, keyper_urls, backend_host, backend_port, keyper_host)
+                start_servers_tui(backend_url, keyper_urls, backend_host, backend_port, keyper_host, bb_url, bb_port, bb_host)
             elif choice == "1":
                 show_dashboard(backend_url, keyper_urls)
             elif choice == "2":
@@ -728,11 +749,15 @@ def main():
                         help="Number of keypers to auto-configure (default: 3, used when --keyper-urls is omitted)")
     parser.add_argument("--keyper-base-port", type=int, default=5001,
                         help="Starting port for auto-configured keypers (default: 5001)")
+    parser.add_argument("--bb-port", type=int, default=5500,
+                        help="Bulletin board port (default: 5500)")
     args = parser.parse_args()
 
     host = args.host
     backend_port = args.backend_port
     backend_url = args.backend or f"http://{host}:{backend_port}"
+    bb_port = args.bb_port
+    bb_url = f"http://{host}:{bb_port}"
 
     if args.keyper_urls:
         keyper_urls = [u.strip() for u in args.keyper_urls.split(",")]
@@ -743,9 +768,9 @@ def main():
         ]
 
     console.print(BANNER)
-    console.print(Align.center(f"[dim]Backend: {backend_url}  |  Keypers: {len(keyper_urls)}[/]"))
+    console.print(Align.center(f"[dim]Backend: {backend_url}  |  BB: {bb_url}  |  Keypers: {len(keyper_urls)}[/]"))
 
-    main_menu(backend_url, keyper_urls, host, backend_port, host)
+    main_menu(backend_url, keyper_urls, host, backend_port, host, bb_url, bb_port, host)
 
 
 if __name__ == "__main__":

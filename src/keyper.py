@@ -23,6 +23,7 @@ from flask import Flask, request, jsonify
 from crypto.primitives import point_to_dict, dict_to_point, CURVE_ORDER
 from crypto.dkg import KeyperDKGState
 from crypto.proofs import prove_decryption_share
+from bulletin_board import BBClient
 
 
 def create_keyper_app(keyper_id):
@@ -47,13 +48,16 @@ def create_keyper_app(keyper_id):
     def dkg_round1():
         """DKG Round 1: Generate secret, polynomial, commitments, and shares.
 
-        Returns ONLY commitments to the backend. Shares are kept locally
-        for peer-to-peer distribution (backend never sees secret shares).
+        Posts commitments to the bulletin board (not returned to backend).
+        Shares are kept locally for peer-to-peer distribution.
         """
         data = request.get_json()
         n = int(data["n"])
         t = int(data["t"])
         kid = int(data["keyper_id"])
+        bb_url = data["bb_url"]
+        election_id = data["election_id"]
+
         if kid != keyper_meta["id"]:
             return jsonify({"error": f"Keyper ID mismatch: configured as {keyper_meta['id']}, received {kid}"}), 400
 
@@ -64,10 +68,17 @@ def create_keyper_app(keyper_id):
         pending_shares.update(shares)
         received_shares.clear()
 
+        # Post commitments to the bulletin board (anti-equivocation)
+        bb = BBClient(bb_url)
+        comms_dicts = [point_to_dict(c) for c in commitments]
+        ok = bb.post(f"dkg/{election_id}/commitments", str(kid), comms_dicts)
+        if not ok:
+            return jsonify({"error": "Failed to post commitments to bulletin board"}), 500
+
         return jsonify({
             "keyper_id": kid,
-            "commitments": [point_to_dict(c) for c in commitments],
-            # Shares are NOT sent to the backend
+            "status": "ok",
+            # Commitments are on the bulletin board, not returned here
         })
 
     @app.route("/dkg/distribute_shares", methods=["POST"])
@@ -113,13 +124,33 @@ def create_keyper_app(keyper_id):
     def dkg_round2():
         """DKG Round 2: Verify received shares and compute combined secret share.
 
-        Shares were received peer-to-peer. Backend sends only commitments (public).
+        Reads commitments from the bulletin board (same view as everyone).
+        Verifies the board digest matches the expected value to detect tampering.
         """
         data = request.get_json()
+        bb_url = data["bb_url"]
+        election_id = data["election_id"]
+        expected_digest = data.get("expected_digest")
+
+        # Read commitments from the bulletin board (anti-equivocation)
+        bb = BBClient(bb_url)
+        topic = f"dkg/{election_id}/commitments"
+
+        # Verify digest if provided (cross-check with what backend computed)
+        if expected_digest:
+            actual_digest = bb.get_digest(topic)
+            if actual_digest != expected_digest:
+                return jsonify({
+                    "keyper_id": keyper_meta["id"],
+                    "verified": False,
+                    "error": f"Bulletin board digest mismatch: expected {expected_digest}, got {actual_digest}",
+                }), 200
+
+        raw_entries = bb.read_topic(topic)
 
         # Parse commitments: {dealer_id_str: [G2 point dicts, ...]}
         all_commitments = {}
-        for dealer_id_str, comms in data["all_commitments"].items():
+        for dealer_id_str, comms in raw_entries.items():
             all_commitments[int(dealer_id_str)] = [dict_to_point(c) for c in comms]
 
         try:
