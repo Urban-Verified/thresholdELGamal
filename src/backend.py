@@ -228,20 +228,61 @@ def create_backend_app(keyper_urls, bb_url):
                 # All keypers verified successfully — DKG complete
                 break
 
-            # Identify malicious dealers: any dealer complained about by at least one honest keyper
-            bad_dealers = set()
-            for complainer, dealers in all_complaints.items():
-                for d in dealers:
-                    bad_dealers.add(d)
+            # --- Complaint resolution (Feldman VSS rebuttal) ---
+            # For each complaint, ask the accused dealer to reveal the disputed
+            # share. Then verify it against the dealer's published commitments:
+            #   share · P₂ == Σⱼ (complainer_id^j mod q) · γⱼ
+            # If it verifies → the complainer lied → exclude the complainer.
+            # If it doesn't verify → the dealer sent a bad share → exclude the dealer.
+            excluded = set()
+            for complainer_kid, accused_dealers in all_complaints.items():
+                if complainer_kid in excluded:
+                    continue
+                for dealer_kid in accused_dealers:
+                    if dealer_kid in excluded:
+                        continue
+                    # Ask the dealer to reveal the share for the complainer
+                    dealer_url = keyper_url_map[dealer_kid]
+                    try:
+                        resp = requests.post(f"{dealer_url}/dkg/reveal_share", json={
+                            "recipient_id": complainer_kid,
+                        }, timeout=10)
+                        resp.raise_for_status()
+                        revealed = resp.json()
+                        revealed_share = int(revealed["share"])
+                    except Exception:
+                        # Dealer refuses or fails to reveal → treat as guilty
+                        excluded.add(dealer_kid)
+                        print(f"[Backend] Dealer {dealer_kid} refused to reveal share for keyper {complainer_kid} — excluding dealer")
+                        continue
 
-            print(f"[Backend] DKG attempt {attempt + 1}: complaints received against dealers {bad_dealers}, retrying without them")
-            active_kids -= bad_dealers
+                    # Verify the revealed share against the dealer's commitments
+                    comms = all_commitments_points[dealer_kid]
+                    expected_pt = Z2
+                    x_power = 1
+                    for j in range(len(comms)):
+                        expected_pt = point_add(expected_pt, point_multiply(comms[j], x_power))
+                        x_power = (x_power * complainer_kid) % CURVE_ORDER
+                    actual_pt = point_multiply(G2, revealed_share)
+
+                    if point_eq(expected_pt, actual_pt):
+                        # Share verifies → complainer filed a false complaint
+                        excluded.add(complainer_kid)
+                        print(f"[Backend] Complaint by keyper {complainer_kid} against dealer {dealer_kid} is FALSE — excluding complainer")
+                        break  # complainer excluded, skip their other complaints
+                    else:
+                        # Share doesn't verify → dealer is guilty
+                        excluded.add(dealer_kid)
+                        print(f"[Backend] Complaint by keyper {complainer_kid} against dealer {dealer_kid} is VALID — excluding dealer")
+
+            print(f"[Backend] DKG attempt {attempt + 1}: excluding {excluded} after complaint resolution, retrying")
+            active_kids -= excluded
 
             # If we removed too many, we can't continue
             if len(active_kids) < t + 1:
                 return jsonify({
-                    "error": f"DKG failed: only {len(active_kids)} honest keypers remain after excluding {bad_dealers}, need {t + 1}",
-                    "excluded_keypers": sorted(bad_dealers),
+                    "error": f"DKG failed: only {len(active_kids)} honest keypers remain after excluding {sorted(excluded)}, need {t + 1}",
+                    "excluded_keypers": sorted(excluded),
                 }), 500
         else:
             # Exhausted retries
@@ -371,8 +412,11 @@ def create_backend_app(keyper_urls, bb_url):
         if not verify_exact_budget(mpk, sum_ct[0], sum_ct[1], B, budget_proof, election_id=election_id):
             return jsonify({"error": "Budget proof is invalid"}), 400
 
-        # Store validated ballot
+        # Store validated ballot (re-check phase under lock to prevent race
+        # with /election/tally — audit issue #3)
         with state["lock"]:
+            if state["phase"] != "voting":
+                return jsonify({"error": f"Not accepting votes in phase '{state['phase']}'"}), 400
             state["ballots"].append(ciphertexts)
 
         ballot_num = len(state["ballots"])

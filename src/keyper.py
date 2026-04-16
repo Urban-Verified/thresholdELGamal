@@ -111,14 +111,39 @@ def create_keyper_app(keyper_id):
 
     @app.route("/dkg/receive_share", methods=["POST"])
     def receive_share():
-        """Receive a secret share from another keyper (peer-to-peer)."""
+        """Receive a secret share from another keyper (peer-to-peer).
+
+        Append-only: rejects a second share from the same dealer to prevent
+        unauthenticated overwrite attacks (audit issue #1).
+        """
         data = request.get_json()
         dealer_id = int(data["dealer_id"])
         share = int(data["share"])
         if share < 0 or share >= CURVE_ORDER:
             return jsonify({"error": "Share value out of scalar field range"}), 400
+        if dealer_id in received_shares:
+            return jsonify({"error": "Share already received from this dealer"}), 409
         received_shares[dealer_id] = share
         return jsonify({"status": "ok"})
+
+    @app.route("/dkg/reveal_share", methods=["POST"])
+    def reveal_share():
+        """Reveal the share this dealer generated for a specific recipient.
+
+        Used during complaint resolution (Feldman VSS rebuttal): the backend
+        asks the accused dealer to publicly reveal the share it computed for
+        the complaining keyper. All participants can then verify the share
+        against the dealer's published commitments to determine who is at fault.
+        """
+        data = request.get_json()
+        recipient_id = int(data["recipient_id"])
+        if recipient_id not in pending_shares:
+            return jsonify({"error": f"No pending share for recipient {recipient_id}"}), 404
+        return jsonify({
+            "dealer_id": keyper_meta["id"],
+            "recipient_id": recipient_id,
+            "share": str(pending_shares[recipient_id]),
+        })
 
     @app.route("/dkg/round2", methods=["POST"])
     def dkg_round2():
@@ -156,13 +181,8 @@ def create_keyper_app(keyper_id):
         try:
             combined_share, public_key_share = dkg_state.round2(all_commitments, received_shares)
         except ValueError as e:
-            # Extract bad dealer IDs from the error message and return as complaints
-            # so the backend can identify and exclude malicious dealers
-            import re
-            match = re.search(r"dealers \[([^\]]+)\]", str(e))
-            bad_dealers = []
-            if match:
-                bad_dealers = [int(x.strip()) for x in match.group(1).split(",")]
+            # Use structured bad_dealers attribute from DKG (no regex parsing)
+            bad_dealers = getattr(e, "bad_dealers", [])
             return jsonify({
                 "keyper_id": keyper_meta["id"],
                 "verified": False,
@@ -170,8 +190,9 @@ def create_keyper_app(keyper_id):
                 "error": str(e),
             }), 200  # 200 so backend can parse the complaint
 
-        # Zeroize share material after DKG completes
-        pending_shares.clear()
+        # Zeroize received shares after DKG completes.
+        # Keep pending_shares alive until complaint resolution completes;
+        # they will be cleared at the start of the next round1.
         received_shares.clear()
 
         return jsonify({

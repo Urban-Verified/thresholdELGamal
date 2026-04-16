@@ -82,7 +82,8 @@ class KeyperDKGState:
           public_key_share = combined_share · P₂ (G2 point)
 
         Returns (combined_share, public_key_share).
-        Raises ValueError if any share verification fails.
+        Raises ValueError with a `bad_dealers` attribute (list of ints) if any
+        share verification fails.
         """
         my_id = self.keyper_id
         bad_dealers = []
@@ -102,9 +103,11 @@ class KeyperDKGState:
                 bad_dealers.append(dealer_id)
 
         if bad_dealers:
-            raise ValueError(
+            err = ValueError(
                 f"Keyper {my_id}: Feldman VSS verification failed for dealers {bad_dealers}"
             )
+            err.bad_dealers = bad_dealers
+            raise err
 
         # Compute combined secret share: mskⱼ = Σₖ sⱼ^(k) mod q
         self.combined_share = sum(received_shares.values()) % CURVE_ORDER
