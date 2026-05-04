@@ -124,3 +124,41 @@ class KeyperDKGState:
         if self.combined_share is None:
             raise RuntimeError("DKG not completed; cannot decrypt")
         return point_multiply(C1, self.combined_share)
+
+
+# ----------------------------------------------------------------------
+#  Public-key derivation from commitments
+#
+#  These are the formulae backend.py and keyper.py share when computing
+#  the joint master public key and per-keyper public-key shares from the
+#  bulletin-board commitments. Pulling them out as module-level functions
+#  ensures both sides agree byte-for-byte.
+# ----------------------------------------------------------------------
+
+def derive_joint_mpk(all_commitments):
+    """Joint master public key = Σ_dealer γ₀^(dealer) over the active dealers.
+
+    ``all_commitments`` maps dealer_id -> [γ₀, γ₁, …, γₜ] (G2 points).
+    """
+    mpk = Z2
+    for dealer_id in sorted(all_commitments):
+        gamma_0 = all_commitments[dealer_id][0]
+        mpk = point_add(mpk, gamma_0)
+    return mpk
+
+
+def derive_mpk_share(target_keyper_id, all_commitments):
+    """mpk_target = Σ_dealer Σ_j (target^j) · γⱼ^(dealer).
+
+    This is the public counterpart of the combined secret share for
+    ``target_keyper_id`` and is what goes on chain as
+    ``committeePKs[target_keyper_id - 1]``.
+    """
+    mpk_share = Z2
+    for dealer_id in sorted(all_commitments):
+        comms = all_commitments[dealer_id]
+        x_power = 1
+        for j in range(len(comms)):
+            mpk_share = point_add(mpk_share, point_multiply(comms[j], x_power))
+            x_power = (x_power * target_keyper_id) % CURVE_ORDER
+    return mpk_share

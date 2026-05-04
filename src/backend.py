@@ -48,7 +48,13 @@ def _parse_scalar(value):
 
 
 def create_backend_app(keyper_urls, bb_url):
-    """Create the election backend Flask app."""
+    """Create the off-chain election backend Flask app.
+
+    On-chain tally aggregation lives in ``src/tally_aggregator.py`` (see
+    PLAN.md decision E). The HTTP endpoints exposed here cover the legacy
+    off-chain election lifecycle that the pure-crypto test suite still
+    exercises; they are not used by the on-chain pipeline.
+    """
     app = Flask("election_backend")
     bb = BBClient(bb_url)
 
@@ -592,6 +598,10 @@ def create_backend_app(keyper_urls, bb_url):
             })
         return jsonify({"status": "ok", "message": "Election reset"})
 
+    # On-chain tally aggregation lives in ``src/tally_aggregator.py`` —
+    # see PLAN.md decision E. This server intentionally exposes nothing
+    # for the on-chain pipeline.
+
     return app
 
 
@@ -610,6 +620,7 @@ def main():
     print(f"[Backend] Starting on {args.host}:{args.port}")
     print(f"[Backend] Keyper URLs: {keyper_urls}")
     print(f"[Backend] Bulletin Board: {args.bb_url}")
+    print("[Backend] Off-chain only — on-chain tally lives in tally_aggregator.py")
     app.run(host=args.host, port=args.port, debug=False, use_reloader=False)
 
 

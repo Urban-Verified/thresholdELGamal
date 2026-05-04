@@ -1,0 +1,986 @@
+[
+  {
+    "type": "function",
+    "name": "TALLY_AGGREGATOR_ROLE",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "VOTE_PROXY_ROLE",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "budget",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint32",
+        "internalType": "uint32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "electionId",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getAggregate",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "encryptedTally",
+        "type": "tuple",
+        "internalType": "struct VotingTypes.EncryptedTally",
+        "components": [
+          {
+            "name": "aggregates",
+            "type": "tuple[]",
+            "internalType": "struct VotingTypes.Ciphertext[]",
+            "components": [
+              {
+                "name": "c1",
+                "type": "bytes",
+                "internalType": "bytes"
+              },
+              {
+                "name": "c2",
+                "type": "bytes",
+                "internalType": "bytes"
+              }
+            ]
+          },
+          {
+            "name": "proof",
+            "type": "bytes",
+            "internalType": "bytes"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getBallot",
+    "inputs": [
+      {
+        "name": "pseudonym",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "ballot",
+        "type": "tuple",
+        "internalType": "struct VotingTypes.Ballot",
+        "components": [
+          {
+            "name": "pseudonym",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "vk",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "ciphertexts",
+            "type": "tuple[]",
+            "internalType": "struct VotingTypes.Ciphertext[]",
+            "components": [
+              {
+                "name": "c1",
+                "type": "bytes",
+                "internalType": "bytes"
+              },
+              {
+                "name": "c2",
+                "type": "bytes",
+                "internalType": "bytes"
+              }
+            ]
+          },
+          {
+            "name": "zkProof",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "voterSignature",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "wrAttestation",
+            "type": "bytes",
+            "internalType": "bytes"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getBallots",
+    "inputs": [
+      {
+        "name": "startIndex",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "count",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "ballots",
+        "type": "tuple[]",
+        "internalType": "struct VotingTypes.Ballot[]",
+        "components": [
+          {
+            "name": "pseudonym",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "vk",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "ciphertexts",
+            "type": "tuple[]",
+            "internalType": "struct VotingTypes.Ciphertext[]",
+            "components": [
+              {
+                "name": "c1",
+                "type": "bytes",
+                "internalType": "bytes"
+              },
+              {
+                "name": "c2",
+                "type": "bytes",
+                "internalType": "bytes"
+              }
+            ]
+          },
+          {
+            "name": "zkProof",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "voterSignature",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "wrAttestation",
+            "type": "bytes",
+            "internalType": "bytes"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getDecryptionShares",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "shares",
+        "type": "tuple[]",
+        "internalType": "struct VotingTypes.DecryptionShare[]",
+        "components": [
+          {
+            "name": "keyperIndex",
+            "type": "uint8",
+            "internalType": "uint8"
+          },
+          {
+            "name": "submittedAt",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "shares",
+            "type": "bytes[]",
+            "internalType": "bytes[]"
+          },
+          {
+            "name": "proofs",
+            "type": "tuple[]",
+            "internalType": "struct VotingTypes.DLEQProof[]",
+            "components": [
+              {
+                "name": "e",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "z",
+                "type": "uint256",
+                "internalType": "uint256"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getElection",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "config",
+        "type": "tuple",
+        "internalType": "struct VotingTypes.ElectionConfigView",
+        "components": [
+          {
+            "name": "electionId",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "votingStart",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "votingEnd",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "selfSubmitFee",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "numCandidates",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "budget",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "thresholdN",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "thresholdT",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "keyperAddresses",
+            "type": "address[]",
+            "internalType": "address[]"
+          },
+          {
+            "name": "pkWR",
+            "type": "bytes",
+            "internalType": "bytes"
+          }
+        ]
+      },
+      {
+        "name": "dkgResult",
+        "type": "tuple",
+        "internalType": "struct VotingTypes.DKGResult",
+        "components": [
+          {
+            "name": "pkElection",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "committeePKs",
+            "type": "bytes[]",
+            "internalType": "bytes[]"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getNumBallots",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getPhase",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "phase",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getResult",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "result",
+        "type": "tuple",
+        "internalType": "struct VotingTypes.ElectionResult",
+        "components": [
+          {
+            "name": "tally",
+            "type": "uint256[]",
+            "internalType": "uint256[]"
+          },
+          {
+            "name": "keyperIndices",
+            "type": "uint8[]",
+            "internalType": "uint8[]"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getRoleAdmin",
+    "inputs": [
+      {
+        "name": "role",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "grantRole",
+    "inputs": [
+      {
+        "name": "role",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "account",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "hasRole",
+    "inputs": [
+      {
+        "name": "role",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "account",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "isDKGFinalized",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "isResultFinalized",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "keyperSet",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract IKeyperSet"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "numCandidates",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint32",
+        "internalType": "uint32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "publishAggregate",
+    "inputs": [
+      {
+        "name": "encryptedTally",
+        "type": "tuple",
+        "internalType": "struct VotingTypes.EncryptedTally",
+        "components": [
+          {
+            "name": "aggregates",
+            "type": "tuple[]",
+            "internalType": "struct VotingTypes.Ciphertext[]",
+            "components": [
+              {
+                "name": "c1",
+                "type": "bytes",
+                "internalType": "bytes"
+              },
+              {
+                "name": "c2",
+                "type": "bytes",
+                "internalType": "bytes"
+              }
+            ]
+          },
+          {
+            "name": "proof",
+            "type": "bytes",
+            "internalType": "bytes"
+          }
+        ]
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "publishResult",
+    "inputs": [
+      {
+        "name": "totals",
+        "type": "uint256[]",
+        "internalType": "uint256[]"
+      },
+      {
+        "name": "keyperIndices",
+        "type": "uint8[]",
+        "internalType": "uint8[]"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "renounceRole",
+    "inputs": [
+      {
+        "name": "role",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "callerConfirmation",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "revokeRole",
+    "inputs": [
+      {
+        "name": "role",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "account",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "selfSubmitFee",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "submitDecryptionShare",
+    "inputs": [
+      {
+        "name": "shares",
+        "type": "bytes[]",
+        "internalType": "bytes[]"
+      },
+      {
+        "name": "proofs",
+        "type": "tuple[]",
+        "internalType": "struct VotingTypes.DLEQProof[]",
+        "components": [
+          {
+            "name": "e",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "z",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ]
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "submitVote",
+    "inputs": [
+      {
+        "name": "ballot",
+        "type": "tuple",
+        "internalType": "struct VotingTypes.Ballot",
+        "components": [
+          {
+            "name": "pseudonym",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "vk",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "ciphertexts",
+            "type": "tuple[]",
+            "internalType": "struct VotingTypes.Ciphertext[]",
+            "components": [
+              {
+                "name": "c1",
+                "type": "bytes",
+                "internalType": "bytes"
+              },
+              {
+                "name": "c2",
+                "type": "bytes",
+                "internalType": "bytes"
+              }
+            ]
+          },
+          {
+            "name": "zkProof",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "voterSignature",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "wrAttestation",
+            "type": "bytes",
+            "internalType": "bytes"
+          }
+        ]
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "payable"
+  },
+  {
+    "type": "function",
+    "name": "voteDKGResult",
+    "inputs": [
+      {
+        "name": "pkElection",
+        "type": "bytes",
+        "internalType": "bytes"
+      },
+      {
+        "name": "committeePKs",
+        "type": "bytes[]",
+        "internalType": "bytes[]"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "votingEnd",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "votingStart",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "withdrawFees",
+    "inputs": [
+      {
+        "name": "recipient",
+        "type": "address",
+        "internalType": "address payable"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "amount",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "event",
+    "name": "AggregatePublished",
+    "inputs": [
+      {
+        "name": "electionId",
+        "type": "uint256",
+        "indexed": true,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "DKGResultPublished",
+    "inputs": [
+      {
+        "name": "pkElection",
+        "type": "bytes",
+        "indexed": false,
+        "internalType": "bytes"
+      },
+      {
+        "name": "committeePKs",
+        "type": "bytes[]",
+        "indexed": false,
+        "internalType": "bytes[]"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "DKGVoteRegistered",
+    "inputs": [
+      {
+        "name": "keyper",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "pkElection",
+        "type": "bytes",
+        "indexed": false,
+        "internalType": "bytes"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "DecryptionSharePosted",
+    "inputs": [
+      {
+        "name": "keyperIndex",
+        "type": "uint8",
+        "indexed": true,
+        "internalType": "uint8"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "FeesWithdrawn",
+    "inputs": [
+      {
+        "name": "recipient",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "ResultPublished",
+    "inputs": [
+      {
+        "name": "tally",
+        "type": "uint256[]",
+        "indexed": false,
+        "internalType": "uint256[]"
+      },
+      {
+        "name": "keyperIndices",
+        "type": "uint8[]",
+        "indexed": false,
+        "internalType": "uint8[]"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "RoleAdminChanged",
+    "inputs": [
+      {
+        "name": "role",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "previousAdminRole",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "newAdminRole",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "RoleGranted",
+    "inputs": [
+      {
+        "name": "role",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "account",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "sender",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "RoleRevoked",
+    "inputs": [
+      {
+        "name": "role",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "account",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "sender",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "VoteSubmitted",
+    "inputs": [
+      {
+        "name": "pseudonym",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "ballotIndex",
+        "type": "uint256",
+        "indexed": true,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "error",
+    "name": "AccessControlBadConfirmation",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "AccessControlUnauthorizedAccount",
+    "inputs": [
+      {
+        "name": "account",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "neededRole",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  }
+]

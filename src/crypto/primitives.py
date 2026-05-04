@@ -10,7 +10,7 @@ Uses py_arkworks_bls12381 (Rust/native) for fast EC operations.
 import hashlib
 import secrets
 
-from py_arkworks_bls12381 import G2Point, Scalar
+from py_arkworks_bls12381 import G1Point, G2Point, Scalar
 
 # BLS12-381 curve order (scalar field order)
 CURVE_ORDER = 52435875175126190479447740508185965837690552500527637822603658699938581184513
@@ -23,6 +23,16 @@ G2 = G2Point()
 
 # Identity element in G2
 Z2 = G2Point.identity()
+
+# Generator and identity of G1 (used for the Schnorr vk on the voter ballot)
+G1 = G1Point()
+Z1 = G1Point.identity()
+
+# Canonical BLS12-381 compressed point sizes (zcash format).
+# The on-chain ``Election`` requires these exact lengths in
+# ``_requireG2Point`` / vk validation, and the SDK uses the same format.
+G1_COMPRESSED_BYTES = 48
+G2_COMPRESSED_BYTES = 96
 
 
 def _int_to_scalar(n):
@@ -165,3 +175,70 @@ def validate_g2_point(P):
 def random_scalar():
     """Generate a cryptographically random scalar in [1, CURVE_ORDER - 1]."""
     return secrets.randbelow(CURVE_ORDER - 1) + 1
+
+
+# ------------------------------------------------------------------
+#  Compressed point codecs (BLS12-381 zcash format)
+#
+#  These are the byte layouts the production contracts and the
+#  shutter-voting-sdk use on the wire. G1 = 48 bytes, G2 = 96 bytes.
+#  The identity element is encoded with the high bit of the first
+#  byte set (0xc0...).
+# ------------------------------------------------------------------
+
+def g2_to_compressed(P) -> bytes:
+    """Serialize a G2 point to 96-byte compressed form."""
+    b = P.to_compressed_bytes()
+    if len(b) != G2_COMPRESSED_BYTES:
+        raise ValueError(
+            f"G2 compressed encoding produced {len(b)} bytes, expected {G2_COMPRESSED_BYTES}"
+        )
+    return bytes(b)
+
+
+def g2_from_compressed(b: bytes):
+    """Deserialize a 96-byte compressed G2 point with subgroup check.
+
+    Raises ValueError if the bytes are the wrong length, not on-curve, or
+    not in the prime-order subgroup.
+    """
+    if len(b) != G2_COMPRESSED_BYTES:
+        raise ValueError(
+            f"Expected {G2_COMPRESSED_BYTES}-byte G2 compressed point, got {len(b)}"
+        )
+    try:
+        P = G2Point.from_compressed_bytes(bytes(b))
+    except Exception as e:
+        raise ValueError(f"Invalid G2 compressed encoding: {e}")
+    if not P.is_in_subgroup():
+        raise ValueError("G2 point is not in the prime-order subgroup")
+    return P
+
+
+def g1_to_compressed(P) -> bytes:
+    """Serialize a G1 point to 48-byte compressed form."""
+    b = P.to_compressed_bytes()
+    if len(b) != G1_COMPRESSED_BYTES:
+        raise ValueError(
+            f"G1 compressed encoding produced {len(b)} bytes, expected {G1_COMPRESSED_BYTES}"
+        )
+    return bytes(b)
+
+
+def g1_from_compressed(b: bytes):
+    """Deserialize a 48-byte compressed G1 point with subgroup check.
+
+    Raises ValueError if the bytes are the wrong length, not on-curve, or
+    not in the prime-order subgroup.
+    """
+    if len(b) != G1_COMPRESSED_BYTES:
+        raise ValueError(
+            f"Expected {G1_COMPRESSED_BYTES}-byte G1 compressed point, got {len(b)}"
+        )
+    try:
+        P = G1Point.from_compressed_bytes(bytes(b))
+    except Exception as e:
+        raise ValueError(f"Invalid G1 compressed encoding: {e}")
+    if not P.is_in_subgroup():
+        raise ValueError("G1 point is not in the prime-order subgroup")
+    return P

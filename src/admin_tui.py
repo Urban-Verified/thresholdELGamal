@@ -29,12 +29,46 @@ from rich import box
 from keyper import create_keyper_app
 from backend import create_backend_app
 from bulletin_board import create_bb_app
+from wr_oracle import create_wr_oracle_app
+from sdk_compat import schnorr_keygen
+from crypto.primitives import g1_to_compressed
+
+import chain_setup
+from chain_setup import ANVIL_KEYS, anvil_address
+from eth_client import EthChain, ElectionClient
 
 console = Console()
 
 # ── Server management ─────────────────────────────────────────────────
 
 _running_servers = {}  # {label: {"thread": Thread, "port": int, "url": str}}
+
+# ── On-chain state ────────────────────────────────────────────────────
+# Populated when the user starts the chain via menu item 'c'.
+_chain_state: dict = {
+    "anvil": None,           # AnvilProcess | None
+    "chain": None,           # EthChain | None
+    "admin_key": None,       # private key string
+    "admin_addr": None,
+    "tally_key": None,       # private key for TALLY_AGGREGATOR_ROLE
+    "tally_addr": None,
+    "proxy_key": None,       # private key for VOTE_PROXY_ROLE
+    "proxy_addr": None,
+    "keyper_keys": [],       # one private key per keyper, in member-index order
+    "keyper_addrs": [],
+    "keyper_set_addr": None,
+    "registry_addr": None,
+    "elections": [],         # list of Election addresses, in publish order
+    # WR oracle — Schnorr-on-G1 keypair (BLS12-381), separate from anvil keys.
+    "wr_sk": None,           # int (Schnorr secret on G1)
+    "wr_pk": None,           # bytes (48-byte compressed G1, written to Election.pkWR)
+    "wr_url": None,          # http://127.0.0.1:<port>/  for the wr_oracle process
+}
+
+
+# Deterministic WR seed for the admin-TUI demo. Distinct from the pytest
+# fixture's seed so the demo and the test suite use different WR identities.
+_WR_SEED_INT = int.from_bytes(b"WR-admin-tui" + b"\x00" * 20, "big") + 1
 
 # ── Branding ──────────────────────────────────────────────────────────
 
@@ -635,29 +669,267 @@ def reset_election(backend_url):
         console.print(f"[red]  Error: {resp.json().get('error', 'Unknown')}[/]")
 
 
+def start_chain_tui(num_keypers: int, threshold: int, anvil_port: int):
+    """Start anvil and deploy KeyperSet + ElectionRegistry."""
+    console.print()
+    console.print(Rule("[bold cyan]On-chain bootstrap[/]", style="cyan"))
+    console.print()
+
+    if _chain_state["anvil"] is not None:
+        console.print("[yellow]  Chain already running. Stop it first (option x).[/]")
+        return
+
+    # Role assignment (deterministic anvil keys; see PLAN.md decision D).
+    admin_key = ANVIL_KEYS[0]
+    tally_key = ANVIL_KEYS[1]
+    proxy_key = ANVIL_KEYS[2]
+    keyper_keys = list(ANVIL_KEYS[3:3 + num_keypers])
+    if len(keyper_keys) < num_keypers:
+        console.print(f"[red]  Need {num_keypers} keypers but only {len(keyper_keys)} anvil keys remain.[/]")
+        return
+
+    keyper_addrs = [anvil_address(k) for k in keyper_keys]
+
+    # WR oracle: deterministic Schnorr-on-G1 keypair (BLS12-381). Lives
+    # outside ANVIL_KEYS because it's not an Ethereum secp256k1 keypair.
+    wr_sk, wr_vk = schnorr_keygen(_WR_SEED_INT)
+    wr_pk = g1_to_compressed(wr_vk)
+
+    plan = Table(box=box.ROUNDED, border_style="cyan")
+    plan.add_column("Role", style="bold cyan")
+    plan.add_column("Address / Key", style="dim")
+    plan.add_row("anvil RPC", f"http://127.0.0.1:{anvil_port}")
+    plan.add_row("admin (Vote Manager)", anvil_address(admin_key))
+    plan.add_row("tally aggregator", anvil_address(tally_key))
+    plan.add_row("vote proxy", anvil_address(proxy_key))
+    for i, addr in enumerate(keyper_addrs, start=1):
+        plan.add_row(f"keyper {i}", addr)
+    plan.add_row("threshold", f"{threshold} of {num_keypers}")
+    plan.add_row("WR vk (G1)", wr_pk.hex()[:48] + "…")
+    console.print(plan)
+    if not Confirm.ask("  Launch anvil and deploy contracts?", default=True):
+        console.print("  [dim]Cancelled.[/]")
+        return
+
+    with Progress(
+        SpinnerColumn("dots12", style="cyan"),
+        TextColumn("[bold white]{task.description}[/]"),
+        TextColumn("[dim]{task.fields[detail]}[/]"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Launching anvil…", detail="")
+        try:
+            anvil = chain_setup.start_anvil(port=anvil_port, log_path="/tmp/anvil.log")
+        except Exception as e:
+            progress.update(task, description="[red]anvil failed[/]", detail=str(e))
+            console.print(f"\n[red]Failed to start anvil: {e}[/]")
+            return
+        progress.update(task, description="anvil up", detail=anvil.rpc_url)
+
+        progress.update(task, description="Deploying KeyperSet…", detail="forge create")
+        try:
+            ks_addr = chain_setup.deploy_keyper_set(
+                rpc_url=anvil.rpc_url, deployer_key=admin_key,
+                members=keyper_addrs, threshold=threshold,
+            )
+        except Exception as e:
+            chain_setup.stop_anvil(anvil)
+            console.print(f"\n[red]KeyperSet deploy failed: {e}[/]")
+            return
+        progress.update(task, description="KeyperSet deployed", detail=ks_addr)
+
+        progress.update(task, description="Deploying ElectionRegistry…", detail="forge create")
+        try:
+            reg_addr = chain_setup.deploy_registry(
+                rpc_url=anvil.rpc_url, deployer_key=admin_key,
+                admin=anvil_address(admin_key),
+            )
+        except Exception as e:
+            chain_setup.stop_anvil(anvil)
+            console.print(f"\n[red]Registry deploy failed: {e}[/]")
+            return
+        progress.update(task, description="Registry deployed", detail=reg_addr)
+
+        # Spin up the dev WR oracle so voters have somewhere to fetch
+        # ballot attestations from. The WR public key written to each
+        # Election's ``pkWR`` is what tally_aggregator.aggregate verifies
+        # ballots against.
+        wr_port = 5300
+        wr_url = f"http://127.0.0.1:{wr_port}"
+        progress.update(task, description="Starting WR oracle…", detail=wr_url)
+        try:
+            wr_app = create_wr_oracle_app(private_key=wr_sk)
+            wr_thread = threading.Thread(
+                target=lambda: wr_app.run(host="127.0.0.1", port=wr_port,
+                                          debug=False, use_reloader=False),
+                daemon=True,
+            )
+            wr_thread.start()
+            _running_servers["wr-oracle"] = {
+                "thread": wr_thread, "port": wr_port, "url": wr_url,
+            }
+        except Exception as e:
+            chain_setup.stop_anvil(anvil)
+            console.print(f"\n[red]WR oracle launch failed: {e}[/]")
+            return
+        progress.update(task, description="WR oracle up", detail=wr_url)
+
+    chain = EthChain.connect(anvil.rpc_url, private_key=admin_key)
+
+    _chain_state.update({
+        "anvil": anvil,
+        "chain": chain,
+        "admin_key": admin_key, "admin_addr": anvil_address(admin_key),
+        "tally_key": tally_key, "tally_addr": anvil_address(tally_key),
+        "proxy_key": proxy_key, "proxy_addr": anvil_address(proxy_key),
+        "keyper_keys": keyper_keys, "keyper_addrs": keyper_addrs,
+        "keyper_set_addr": ks_addr,
+        "registry_addr": reg_addr,
+        "elections": [],
+        "wr_sk": wr_sk, "wr_pk": wr_pk, "wr_url": wr_url,
+    })
+
+    console.print(Panel(
+        f"[bold green]  ✓ Chain ready[/]\n\n"
+        f"  [bold]anvil:[/]            [dim]{anvil.rpc_url}[/]\n"
+        f"  [bold]KeyperSet:[/]        [dim]{ks_addr}[/]\n"
+        f"  [bold]ElectionRegistry:[/] [dim]{reg_addr}[/]\n"
+        f"  [bold]WR oracle:[/]        [dim]{wr_url}[/]\n"
+        f"  [bold]WR vk:[/]            [dim]{wr_pk.hex()[:24]}…[/]\n"
+        f"  [bold]threshold:[/]        [dim]{threshold} of {num_keypers}[/]\n",
+        border_style="green",
+        box=box.ROUNDED,
+    ))
+
+
+def create_election_on_chain_tui():
+    """Wizard that calls ElectionRegistry.publishElection on demand."""
+    console.print()
+    console.print(Rule("[bold cyan]Create election on chain[/]", style="cyan"))
+    console.print()
+
+    if _chain_state["registry_addr"] is None:
+        console.print("[yellow]  Chain not running. Start it first (option c).[/]")
+        return
+
+    num_candidates = IntPrompt.ask("  Number of candidates", default=3)
+    budget = IntPrompt.ask("  Budget (votes per ballot)", default=1)
+    voting_window_hours = IntPrompt.ask("  Voting window (hours from now)", default=24)
+    self_submit_fee = IntPrompt.ask("  Self-submit fee in wei (0 to disable)", default=0)
+
+    now = int(time.time())
+    voting_start = now - 60  # backdate by a minute so submitVote opens immediately
+    voting_end = now + voting_window_hours * 3600
+
+    pk_wr = _chain_state["wr_pk"]
+
+    summary = Table(box=box.SIMPLE, border_style="cyan", show_header=False)
+    summary.add_row("[bold]numCandidates[/]", str(num_candidates))
+    summary.add_row("[bold]budget[/]", str(budget))
+    summary.add_row("[bold]votingStart[/]", f"{voting_start}  [dim](now − 60s)[/]")
+    summary.add_row("[bold]votingEnd[/]", f"{voting_end}  [dim](in {voting_window_hours}h)[/]")
+    summary.add_row("[bold]selfSubmitFee[/]", f"{self_submit_fee} wei")
+    summary.add_row("[bold]tallyAggregator[/]", _chain_state["tally_addr"])
+    summary.add_row("[bold]voteProxy[/]", _chain_state["proxy_addr"])
+    summary.add_row("[bold]keyperSet[/]", _chain_state["keyper_set_addr"])
+    summary.add_row("[bold]pkWR[/]", pk_wr.hex()[:24] + "…")
+    console.print(summary)
+
+    if not Confirm.ask("  Publish?", default=True):
+        console.print("  [dim]Cancelled.[/]")
+        return
+
+    try:
+        election_addr = chain_setup.publish_election(
+            chain=_chain_state["chain"],
+            registry_address=_chain_state["registry_addr"],
+            keyper_set_address=_chain_state["keyper_set_addr"],
+            voting_start=voting_start,
+            voting_end=voting_end,
+            num_candidates=num_candidates,
+            budget=budget,
+            self_submit_fee=self_submit_fee,
+            pk_wr=pk_wr,
+            tally_aggregator=_chain_state["tally_addr"],
+            vote_proxy=_chain_state["proxy_addr"],
+        )
+    except Exception as e:
+        console.print(f"\n[red]publishElection failed: {e}[/]")
+        return
+
+    _chain_state["elections"].append(election_addr)
+
+    election = ElectionClient(_chain_state["chain"], election_addr)
+    info = election.get_election()
+    console.print(Panel(
+        f"[bold green]  ✓ Election #{info['config']['electionId']} published[/]\n\n"
+        f"  [bold]address:[/]       [dim]{election_addr}[/]\n"
+        f"  [bold]numCandidates:[/] [dim]{info['config']['numCandidates']}[/]\n"
+        f"  [bold]budget:[/]        [dim]{info['config']['budget']}[/]\n"
+        f"  [bold]votingStart:[/]   [dim]{info['config']['votingStart']}[/]\n"
+        f"  [bold]votingEnd:[/]     [dim]{info['config']['votingEnd']}[/]\n"
+        f"  [bold]getPhase():[/]    [dim]{election.get_phase()}[/]\n",
+        border_style="green",
+        box=box.ROUNDED,
+    ))
+
+
+def stop_chain_tui():
+    """Tear down anvil and clear chain state."""
+    console.print()
+    console.print(Rule("[bold yellow]Stop chain[/]", style="yellow"))
+
+    if _chain_state["anvil"] is None:
+        console.print("[yellow]  Chain is not running.[/]")
+        return
+
+    chain_setup.stop_anvil(_chain_state["anvil"])
+    for k in list(_chain_state.keys()):
+        _chain_state[k] = [] if isinstance(_chain_state[k], list) else None
+    console.print("[dim]  anvil terminated; chain state cleared.[/]")
+
+
 def main_menu(backend_url, keyper_urls, backend_host, backend_port, keyper_host, bb_url, bb_port, bb_host):
     """Main interactive menu loop."""
     while True:
         # Show running server count in header
         alive = sum(1 for s in _running_servers.values() if s["thread"].is_alive())
         server_indicator = f"  [dim green]● {alive} servers running[/]" if alive else "  [dim red]● No servers running[/]"
+        if _chain_state["anvil"] is not None:
+            n_elec = len(_chain_state["elections"])
+            chain_indicator = (
+                f"  [dim green]● chain up — KeyperSet={_chain_state['keyper_set_addr'][:10]}…  "
+                f"Registry={_chain_state['registry_addr'][:10]}…  "
+                f"elections={n_elec}[/]"
+            )
+        else:
+            chain_indicator = "  [dim]● chain not running[/]"
 
         console.print()
         console.print(Rule("[bold magenta]Admin Menu[/]", style="dim"))
         console.print(server_indicator)
+        console.print(chain_indicator)
         console.print()
         console.print("  [bold green]0[/]  Start servers (backend + keypers)")
         console.print("  [bold magenta]1[/]  Dashboard & keyper health")
-        console.print("  [bold magenta]2[/]  Create election")
+        console.print("  [bold magenta]2[/]  Create election (off-chain backend)")
         console.print("  [bold magenta]3[/]  Run DKG (distributed key generation)")
         console.print("  [bold magenta]4[/]  Monitor ballots")
         console.print("  [bold magenta]5[/]  Tally & decrypt results")
         console.print("  [bold magenta]6[/]  View results")
         console.print("  [bold red]7[/]  Reset election")
+        console.print("  [dim]── on-chain ──[/]")
+        console.print("  [bold cyan]c[/]  Start chain (anvil + KeyperSet + Registry)")
+        console.print("  [bold cyan]e[/]  Create election on chain (publishElection)")
+        console.print("  [bold yellow]x[/]  Stop chain")
         console.print("  [bold magenta]q[/]  Quit")
         console.print()
 
-        choice = Prompt.ask("[bold]Select[/]", choices=["0", "1", "2", "3", "4", "5", "6", "7", "q"], default="0")
+        choice = Prompt.ask(
+            "[bold]Select[/]",
+            choices=["0", "1", "2", "3", "4", "5", "6", "7", "c", "e", "x", "q"],
+            default="0",
+        )
 
         try:
             if choice == "0":
@@ -676,7 +948,16 @@ def main_menu(backend_url, keyper_urls, backend_host, backend_port, keyper_host,
                 show_result_view(backend_url)
             elif choice == "7":
                 reset_election(backend_url)
+            elif choice == "c":
+                start_chain_tui(num_keypers=len(keyper_urls), threshold=max(1, len(keyper_urls) - 1), anvil_port=8545)
+            elif choice == "e":
+                create_election_on_chain_tui()
+            elif choice == "x":
+                stop_chain_tui()
             elif choice == "q":
+                if _chain_state["anvil"] is not None:
+                    console.print("\n[dim]Stopping anvil…[/]")
+                    chain_setup.stop_anvil(_chain_state["anvil"])
                 if alive:
                     console.print(f"\n[dim]Shutting down {alive} daemon server(s)…[/]")
                 console.print("[dim]Goodbye.[/]")
