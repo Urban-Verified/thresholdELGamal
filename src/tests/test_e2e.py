@@ -30,7 +30,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from keyper import create_keyper_app
 from backend import create_backend_app
-from bulletin_board import create_bb_app
 from crypto.primitives import (
     CURVE_ORDER, point_to_dict, dict_to_point,
 )
@@ -135,12 +134,6 @@ def test_single_choice_election():
     print("TEST 1: Single-Choice Election (B=1)")
     print("=" * 60)
 
-    # Start bulletin board
-    bb_port = 6099
-    bb_app = create_bb_app()
-    start_flask_in_thread(bb_app, bb_port)
-    bb_url = f"http://127.0.0.1:{bb_port}"
-
     # Start keypers
     n_keypers = 3
     keyper_base_port = 6100
@@ -153,12 +146,11 @@ def test_single_choice_election():
 
     # Start backend
     backend_port = 6000
-    backend_app = create_backend_app(keyper_urls, bb_url)
+    backend_app = create_backend_app(keyper_urls)
     start_flask_in_thread(backend_app, backend_port)
     backend_url = f"http://127.0.0.1:{backend_port}"
 
     # Wait for servers
-    assert wait_for_server(f"{bb_url}/bb/status"), "Bulletin board not ready"
     for url in keyper_urls:
         assert wait_for_server(f"{url}/status"), f"Keyper {url} not ready"
     assert wait_for_server(f"{backend_url}/election/status"), "Backend not ready"
@@ -211,10 +203,6 @@ def test_budget_election():
     print("TEST 2: Budget Election (B=3)")
     print("=" * 60)
 
-    bb_port = 6199
-    bb_app = create_bb_app()
-    start_flask_in_thread(bb_app, bb_port)
-    bb_url = f"http://127.0.0.1:{bb_port}"
 
     n_keypers = 3
     keyper_base_port = 6200
@@ -226,11 +214,10 @@ def test_budget_election():
         keyper_urls.append(f"http://127.0.0.1:{port}")
 
     backend_port = 6010
-    backend_app = create_backend_app(keyper_urls, bb_url)
+    backend_app = create_backend_app(keyper_urls)
     start_flask_in_thread(backend_app, backend_port)
     backend_url = f"http://127.0.0.1:{backend_port}"
 
-    assert wait_for_server(f"{bb_url}/bb/status"), "Bulletin board not ready"
     for url in keyper_urls:
         assert wait_for_server(f"{url}/status"), f"Keyper {url} not ready"
     assert wait_for_server(f"{backend_url}/election/status"), "Backend not ready"
@@ -276,10 +263,6 @@ def test_reject_invalid_vote():
     print("TEST 3: Reject Invalid Vote")
     print("=" * 60)
 
-    bb_port = 6299
-    bb_app = create_bb_app()
-    start_flask_in_thread(bb_app, bb_port)
-    bb_url = f"http://127.0.0.1:{bb_port}"
 
     n_keypers = 3
     keyper_base_port = 6300
@@ -291,11 +274,10 @@ def test_reject_invalid_vote():
         keyper_urls.append(f"http://127.0.0.1:{port}")
 
     backend_port = 6020
-    backend_app = create_backend_app(keyper_urls, bb_url)
+    backend_app = create_backend_app(keyper_urls)
     start_flask_in_thread(backend_app, backend_port)
     backend_url = f"http://127.0.0.1:{backend_port}"
 
-    assert wait_for_server(f"{bb_url}/bb/status"), "Bulletin board not ready"
     for url in keyper_urls:
         assert wait_for_server(f"{url}/status"), f"Keyper {url} not ready"
     assert wait_for_server(f"{backend_url}/election/status"), "Backend not ready"
@@ -357,10 +339,6 @@ def test_five_keyper_election():
     print("TEST 4: Five-Keyper Election (n=5, t=2)")
     print("=" * 60)
 
-    bb_port = 6399
-    bb_app = create_bb_app()
-    start_flask_in_thread(bb_app, bb_port)
-    bb_url = f"http://127.0.0.1:{bb_port}"
 
     n_keypers = 5
     keyper_base_port = 6400
@@ -372,11 +350,10 @@ def test_five_keyper_election():
         keyper_urls.append(f"http://127.0.0.1:{port}")
 
     backend_port = 6030
-    backend_app = create_backend_app(keyper_urls, bb_url)
+    backend_app = create_backend_app(keyper_urls)
     start_flask_in_thread(backend_app, backend_port)
     backend_url = f"http://127.0.0.1:{backend_port}"
 
-    assert wait_for_server(f"{bb_url}/bb/status"), "Bulletin board not ready"
     for url in keyper_urls:
         assert wait_for_server(f"{url}/status"), f"Keyper {url} not ready"
     assert wait_for_server(f"{backend_url}/election/status"), "Backend not ready"

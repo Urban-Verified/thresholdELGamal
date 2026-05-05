@@ -13,25 +13,22 @@ Individual votes are encrypted client-side — the backend never sees plaintext.
 ```
 ┌────────┐     encrypted vote + ZK proofs     ┌─────────┐     partial decryption     ┌──────────┐
 │ Voter  │ ──────────────────────────────────► │ Backend │ ◄──────────────────────── │ Keyper 1 │
-│  CLI   │                                     │ Server  │                            └──────────┘
-└────────┘                                     │         │ ◄──────────────────────── ┌──────────┐
+│  CLI   │                                     │ Server  │                            └────▲─────┘
+└────────┘                                     │         │ ◄──────────────────────── ┌────┴─────┐
                                                │         │                            │ Keyper 2 │
-                                               │         │                            └──────────┘
-                                               │         │ ◄──────────────────────── ┌──────────┐
+                                               │         │                            └────▲─────┘
+                                               │         │ ◄──────────────────────── ┌────┴─────┐
                                                │         │                            │ Keyper 3 │
                                                └─────────┘                            └──────────┘
-                                                    │                                      │
-                                                    │         ┌────────────────┐           │
-                                                    └────────►│  Bulletin      │◄──────────┘
-                                                              │  Board         │  commitments
-                                                              │  (append-only) │  (anti-equivocation)
-                                                              └────────────────┘
+                                                                                  signed P2P
+                                                                                  (commitments
+                                                                                  + shares)
 ```
 
 **Voter CLI** — Encrypts votes locally, generates ZK proofs, submits to backend.
 **Backend Server** — Manages election lifecycle, validates proofs, aggregates ciphertexts, orchestrates decryption.
-**Keyper Servers** — Threshold committee members. Participate in DKG and provide partial decryption shares.
-**Bulletin Board** — Neutral append-only log. Keypers post DKG commitments here instead of relaying through the backend, preventing equivocation (no party can show different commitments to different recipients). Topics are freezable with SHA-256 digests for cross-verification.
+**Keyper Servers** — Threshold committee members. Participate in DKG (round-1 Feldman commitments and round-2 shares are exchanged directly between keypers over signed HTTP — see "Anti-equivocation" below) and provide partial decryption shares.
+**Anti-equivocation (signed P2P)** — Each DKG message is signed with the dealer's keyper key (recovered against its registered ``KeyperSet`` member address). A dealer that sends inconsistent commitments to different recipients is caught either by Feldman VSS verification at round 2 or, in the on-chain pipeline, by the ``voteDKGResult`` threshold vote failing to finalize.
 
 ## Cryptographic Primitives
 
@@ -40,7 +37,7 @@ Individual votes are encrypted client-side — the backend never sees plaintext.
 | Curve | BLS12-381 G2 (Type-3 pairing curve, 255-bit scalar field, 128-bit security) |
 | Encryption | ElGamal in the exponent over G2: C = (r·P₂, r·mpk + m·P₂) |
 | Homomorphism | Component-wise EC point addition: Enc(a) + Enc(b) = Enc(a+b) |
-| DKG | Feldman VSS (2-round protocol, peer-to-peer share delivery, bulletin board commitments) |
+| DKG | Feldman VSS (2-round protocol; round-1 commitments + round-2 shares delivered keyper-to-keyper over signed HTTP) |
 | Range proofs | (B+1)-branch OR-composition of DLEQ proofs (Fiat-Shamir) |
 | Budget proofs | DLEQ proof that Σvⱼ = B on aggregated ciphertext |
 | Decryption proofs | DLEQ proof: dlog_{P₂}(mpkₖ) = dlog_{C₁}(σₖ) |
@@ -52,7 +49,7 @@ Individual votes are encrypted client-side — the backend never sees plaintext.
 ## Election Lifecycle
 
 1. **Create** — Backend initializes election parameters for BLS12-381 G2 (no prime generation needed — curve parameters are fixed constants).
-2. **DKG** — Backend coordinates 2-round Feldman VSS. Keypers post commitments to a neutral **bulletin board** (append-only, freezable); secret shares are distributed peer-to-peer between keypers (backend never sees them). All participants read identical commitments from the board and verify a SHA-256 digest, preventing equivocation. The joint public key mpk is published.
+2. **DKG** — Backend coordinates 2-round Feldman VSS by sequencing the keyper HTTP calls. Round-1 commitments and round-2 secret shares are distributed peer-to-peer between keypers as **EIP-191-signed messages** (signer key = the keyper's `KeyperSet` member key); the backend never sees the secret shares. Each keyper verifies the dealer's signature recovers to the expected member address before storing. Equivocation is caught either by Feldman VSS verification at round 2 (raising a complaint that the backend resolves via signed share-reveal), or — in the on-chain pipeline — by the on-chain `voteDKGResult` threshold vote failing to finalize. The joint public key mpk is published.
 3. **Voting** — Each voter encrypts their ballot client-side, generates range proofs (each vote in {0, …, B}) and a budget proof (sum = B), and submits to the backend. The backend validates all proofs before accepting.
 4. **Tally** — Backend homomorphically aggregates all ballots per candidate via EC point addition, then requests partial decryption shares (with DLEQ correctness proofs) from keypers. Only t+1 of n keypers are needed. Lagrange interpolation on EC points recovers m·P₂, then BSGS recovers m.
 
@@ -66,16 +63,13 @@ pip install -r requirements.txt
 ### Run an election manually
 
 ```bash
-# Start bulletin board
-python bulletin_board.py --port 5500 &
-
 # Start 3 keypers
 python keyper.py --id 1 --port 5001 &
 python keyper.py --id 2 --port 5002 &
 python keyper.py --id 3 --port 5003 &
 
 # Start backend
-python backend.py --port 5000 --bb-url http://127.0.0.1:5500 \
+python backend.py --port 5000 \
   --keyper-urls http://127.0.0.1:5001,http://127.0.0.1:5002,http://127.0.0.1:5003
 ```
 
@@ -117,7 +111,7 @@ cd src
 python admin_tui.py
 
 # Or customize
-python admin_tui.py --num-keypers 5 --backend-port 5000 --keyper-base-port 5001 --bb-port 5500
+python admin_tui.py --num-keypers 5 --backend-port 5000 --keyper-base-port 5001
 
 # Or point to existing servers
 python admin_tui.py --keyper-urls http://127.0.0.1:5001,http://127.0.0.1:5002,http://127.0.0.1:5003
@@ -156,7 +150,7 @@ python -u tests/test_tally_perf.py
 78+ tests covering:
 - **Unit tests** — BLS12-381 curve constants, G2 point arithmetic, serialization/deserialization with subgroup checks, ElGamal encryption/decryption, homomorphic addition, BSGS discrete log, Lagrange coefficients, DKG (various n/t, Feldman verification, bad share rejection), range/budget/decryption ZK proofs (completeness, soundness, tampering, domain separation, election binding).
 - **Integration tests** — Full crypto pipeline (DKG → encrypt → prove → aggregate → threshold decrypt) without servers, including any-subset threshold property and decryption share proof verification.
-- **E2E tests** — Full HTTP lifecycle with bulletin board, peer-to-peer DKG: single-choice elections, budget elections, 5-keyper elections, invalid vote rejection.
+- **E2E tests** — Full HTTP lifecycle with signed P2P keyper DKG: single-choice elections, budget elections, 5-keyper elections, invalid vote rejection.
 - **Stress tests** — 100 concurrent votes with 10 candidates and budget 10; 10,000-ballot tally performance benchmarks.
 
 ## Project Structure
@@ -173,12 +167,17 @@ src/
 │   ├── test_e2e.py            # HTTP lifecycle E2E tests (4 tests)
 │   ├── test_stress.py         # Stress test (100 votes, 10 candidates)
 │   └── test_tally_perf.py     # Tally performance benchmark (10k ballots)
-├── backend.py             # Election backend server (Flask)
-├── bulletin_board.py      # Neutral append-only bulletin board (Flask)
-├── keyper.py              # Keyper server (Flask) with P2P share delivery
+├── backend.py             # Election backend server (Flask, off-chain orchestrator)
+├── keyper.py              # Keyper server (Flask) with signed P2P DKG (commitments + shares)
 ├── voter.py               # Voter CLI
 ├── voter_tui.py           # Interactive voter TUI (rich)
 ├── admin_tui.py           # Admin TUI with server management (rich)
+├── tally_aggregator.py    # On-chain tally aggregator (library + CLI; PLAN.md decision E)
+├── vote_proxy.py          # Dev-only ballot forwarder
+├── wr_oracle.py           # Dev Wahlregister-Server stub (Schnorr on G1)
+├── chain_setup.py         # anvil + forge create + publishElection helpers
+├── eth_client.py          # web3.py wrappers for KeyperSet / Registry / Election
+├── sdk_compat.py          # Python port of the shutter-voting-sdk subset we need
 └── requirements.txt
 ```
 
@@ -189,7 +188,7 @@ src/
 | Endpoint | Method | Description |
 |---|---|---|
 | `/election/create` | POST | Create election (n, t, candidates, budget) |
-| `/election/dkg` | POST | Run distributed key generation (via bulletin board + P2P) |
+| `/election/dkg` | POST | Run distributed key generation (signed P2P keyper-to-keyper) |
 | `/election/params` | GET | Get public parameters (curve, mpk, B, candidates, n, t) |
 | `/election/vote` | POST | Submit encrypted vote with ZK proofs |
 | `/election/tally` | POST | Aggregate and threshold-decrypt |
@@ -197,16 +196,19 @@ src/
 | `/election/status` | GET | Get election phase and metadata |
 | `/election/reset` | POST | Reset election state |
 
-### Bulletin Board
+### Keyper (P2P endpoints)
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/bb/post` | POST | Post entry `{topic, sender_id, data}` (append-only, no overwrites) |
-| `/bb/read/<topic>` | GET | Read all entries for a topic |
-| `/bb/entry/<topic>/<id>` | GET | Read a single entry |
-| `/bb/freeze` | POST | Freeze topic `{topic}` — returns SHA-256 digest |
-| `/bb/digest/<topic>` | GET | Current topic digest |
-| `/bb/status` | GET | Health check |
+| `/dkg/round1` | POST | Generate polynomial + commitments + shares; pin election context |
+| `/dkg/distribute_commitments` | POST | Fan out signed commitments to other keypers |
+| `/dkg/receive_commitments` | POST | Append-only, signature-verified intake from a peer |
+| `/dkg/distribute_shares` | POST | Fan out signed secret shares to other keypers |
+| `/dkg/receive_share` | POST | Append-only, signature-verified intake from a peer |
+| `/dkg/reveal_share` | POST | Signed share reveal for Feldman VSS complaint resolution |
+| `/dkg/round2` | POST | Verify received shares against received commitments |
+| `/dkg/publish_on_chain` | POST | Submit `voteDKGResult` (chain mode only) |
+| `/decrypt/publish_on_chain` | POST | Submit `submitDecryptionShare` (chain mode only) |
 
 ## Security Properties
 
@@ -218,7 +220,7 @@ src/
 - Decryption correctness (DLEQ proofs on partial decryption shares, verified against DKG-established keys)
 - Feldman VSS verification (detects dishonest keypers during DKG)
 - Peer-to-peer DKG share distribution (backend never sees secret shares)
-- Anti-equivocation bulletin board (append-only commitments, freezable topics, SHA-256 digest cross-verification)
+- Anti-equivocation via signed P2P DKG (EIP-191 over `(electionId, dealerId, recipientId, share)` / `(electionId, dealerId, commitments)`; receivers verify signature recovers to dealer's KeyperSet member address; appen-only per dealer)
 - G2 subgroup membership validation on all deserialized points (cofactor attack protection)
 - Ciphertext and commitment group membership validation
 - CSPRNG for all secret material (`secrets` module)
@@ -231,12 +233,14 @@ src/
 - Voter authentication (OIDC / Keycloak)
 - Ballot signatures and replay protection
 - Transport encryption (HTTPS / TLS for P2P keyper channels)
-- Replicated / blockchain-backed bulletin board (current implementation is centralized in-memory)
+- Phase-2 equivocation diagnostics (a digest-echo round between keypers so a misbehaving dealer is named locally instead of "DKG didn't reach threshold on chain"). Phase 1 — signed P2P + on-chain threshold vote — is shipped.
 - Voter pseudonymization
 
 ## Dependencies
 
 - **py_arkworks_bls12381** — BLS12-381 elliptic curve operations via Rust/arkworks bindings (50–730× faster than py_ecc)
-- **Flask** — HTTP servers for backend, keypers, and bulletin board
-- **requests** — HTTP client for voter CLI, backend↔keyper coordination, keyper↔keyper P2P share delivery, and bulletin board access
+- **Flask** — HTTP servers for backend and keypers
+- **requests** — HTTP client for voter CLI, backend↔keyper coordination, and keyper↔keyper signed P2P (commitments, shares, reveals)
+- **eth-account / eth-utils** — EIP-191 personal_sign / recover used to authenticate every keyper-to-keyper DKG message
+- **web3.py** — chain interactions against the production bulletin-board contracts
 - **rich** — Terminal UI rendering (panels, tables, progress bars, live displays)

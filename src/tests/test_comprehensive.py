@@ -830,8 +830,7 @@ def _next_ports(n_keypers):
     _PORT_COUNTER[0] += n_keypers + 2  # +1 backend, +n_keypers, +1 BB
     backend_port = base
     keyper_ports = list(range(base + 1, base + 1 + n_keypers))
-    bb_port = base + 1 + n_keypers
-    return backend_port, keyper_ports, bb_port
+    return backend_port, keyper_ports
 
 
 class TestE2ESingleChoice(unittest.TestCase):
@@ -841,25 +840,18 @@ class TestE2ESingleChoice(unittest.TestCase):
     def setUpClass(cls):
         from keyper import create_keyper_app
         from backend import create_backend_app
-        from bulletin_board import create_bb_app
-
+        
         n_keypers = 3
-        cls.backend_port, cls.keyper_ports, cls.bb_port = _next_ports(n_keypers)
+        cls.backend_port, cls.keyper_ports = _next_ports(n_keypers)
         cls.backend_url = f"http://127.0.0.1:{cls.backend_port}"
         cls.keyper_urls = [f"http://127.0.0.1:{p}" for p in cls.keyper_ports]
-        cls.bb_url = f"http://127.0.0.1:{cls.bb_port}"
-
-        bb_app = create_bb_app()
-        _start_flask(bb_app, cls.bb_port)
 
         for i, port in enumerate(cls.keyper_ports):
             app = create_keyper_app(i + 1)
             _start_flask(app, port)
 
-        backend_app = create_backend_app(cls.keyper_urls, cls.bb_url)
+        backend_app = create_backend_app(cls.keyper_urls)
         _start_flask(backend_app, cls.backend_port)
-
-        assert _wait_for(f"{cls.bb_url}/bb/status"), "Bulletin board not ready"
         for url in cls.keyper_urls:
             assert _wait_for(f"{url}/status"), f"Keyper at {url} not ready"
         assert _wait_for(f"{cls.backend_url}/election/status"), "Backend not ready"
@@ -895,25 +887,18 @@ class TestE2EBudgetVote(unittest.TestCase):
     def setUpClass(cls):
         from keyper import create_keyper_app
         from backend import create_backend_app
-        from bulletin_board import create_bb_app
-
+        
         n_keypers = 3
-        cls.backend_port, cls.keyper_ports, cls.bb_port = _next_ports(n_keypers)
+        cls.backend_port, cls.keyper_ports = _next_ports(n_keypers)
         cls.backend_url = f"http://127.0.0.1:{cls.backend_port}"
         cls.keyper_urls = [f"http://127.0.0.1:{p}" for p in cls.keyper_ports]
-        cls.bb_url = f"http://127.0.0.1:{cls.bb_port}"
-
-        bb_app = create_bb_app()
-        _start_flask(bb_app, cls.bb_port)
 
         for i, port in enumerate(cls.keyper_ports):
             app = create_keyper_app(i + 1)
             _start_flask(app, port)
 
-        backend_app = create_backend_app(cls.keyper_urls, cls.bb_url)
+        backend_app = create_backend_app(cls.keyper_urls)
         _start_flask(backend_app, cls.backend_port)
-
-        assert _wait_for(f"{cls.bb_url}/bb/status"), "Bulletin board not ready"
         for url in cls.keyper_urls:
             assert _wait_for(f"{url}/status"), f"Keyper at {url} not ready"
         assert _wait_for(f"{cls.backend_url}/election/status"), "Backend not ready"
@@ -948,25 +933,18 @@ class TestE2ERejectInvalidVote(unittest.TestCase):
     def setUpClass(cls):
         from keyper import create_keyper_app
         from backend import create_backend_app
-        from bulletin_board import create_bb_app
-
+        
         n_keypers = 3
-        cls.backend_port, cls.keyper_ports, cls.bb_port = _next_ports(n_keypers)
+        cls.backend_port, cls.keyper_ports = _next_ports(n_keypers)
         cls.backend_url = f"http://127.0.0.1:{cls.backend_port}"
         cls.keyper_urls = [f"http://127.0.0.1:{p}" for p in cls.keyper_ports]
-        cls.bb_url = f"http://127.0.0.1:{cls.bb_port}"
-
-        bb_app = create_bb_app()
-        _start_flask(bb_app, cls.bb_port)
 
         for i, port in enumerate(cls.keyper_ports):
             app = create_keyper_app(i + 1)
             _start_flask(app, port)
 
-        backend_app = create_backend_app(cls.keyper_urls, cls.bb_url)
+        backend_app = create_backend_app(cls.keyper_urls)
         _start_flask(backend_app, cls.backend_port)
-
-        assert _wait_for(f"{cls.bb_url}/bb/status"), "Bulletin board not ready"
         for url in cls.keyper_urls:
             assert _wait_for(f"{url}/status"), f"Keyper at {url} not ready"
         assert _wait_for(f"{cls.backend_url}/election/status"), "Backend not ready"

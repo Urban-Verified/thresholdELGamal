@@ -53,8 +53,7 @@ short-lived CLIs:
 | Process / CLI         | Role                                                              |
 | --------------------- | ----------------------------------------------------------------- |
 | `anvil`               | Local EVM node                                                    |
-| `bulletin_board.py`   | DKG round-1 commitment log (decision A — kept temporarily)        |
-| `keyper.py × N`       | Threshold committee members; publish DKG result + shares on chain |
+| `keyper.py × N`       | Threshold committee members; run DKG over signed P2P HTTP (commitments + shares); publish DKG result + decryption shares on chain. |
 | `wr_oracle.py`        | Dev Wahlregister-Server stub; signs ballot attestations on G1     |
 | `vote_proxy.py`       | Dev stub holding `VOTE_PROXY_ROLE`; forwards ballots              |
 | voter (CLI)           | Encrypts, signs, attests, and submits ballots through the proxy   |
@@ -111,10 +110,9 @@ these are the same keys every anvil instance ships with).
 # Shell 1 — anvil
 anvil --port 8545
 
-# Shell 2 — bulletin board (decision A)
-cd src && ../.venv/bin/python bulletin_board.py --port 5500
-
-# Shells 3–5 — keypers (each with its own anvil key)
+# Shells 2–4 — keypers (each with its own anvil key). The same private
+# key signs both the on-chain transactions and the P2P DKG messages
+# (commitments + shares + reveals).
 cd src
 KEYPER_PRIVATE_KEY=0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6 \
   ../.venv/bin/python keyper.py --id 1 --port 5001 --rpc-url http://127.0.0.1:8545
@@ -128,13 +126,13 @@ KEYPER_PRIVATE_KEY=0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092e
 # Then export them for the remaining processes:
 export ELECTION_ADDR=0x...    # from the TUI's "Election #1 published" panel
 
-# Shell 6 — WR oracle (deterministic dev keypair). Capture the printed vk —
+# Shell 5 — WR oracle (deterministic dev keypair). Capture the printed vk —
 # you'll need it as pkWR when publishing the election.
 cd src
 WR_PRIVATE_KEY=0x577200000000000000000000000000000000000000000000000000000000000001 \
   ../.venv/bin/python wr_oracle.py --port 5300
 
-# Shell 7 — vote proxy
+# Shell 6 — vote proxy
 cd src
 VOTE_PROXY_PRIVATE_KEY=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a \
   ../.venv/bin/python vote_proxy.py \
@@ -151,22 +149,34 @@ Now drive the lifecycle (any shell). DKG orchestration still uses the
 keyper HTTP endpoints directly:
 
 ```sh
-# Run DKG round 1 → P2P share distribution → round 2 (off-chain steps).
+# Run DKG: round 1 → signed-P2P commitment fan-out → signed-P2P share
+# distribution → round 2 (verify locally). Each keyper needs the full
+# ``members`` list of expected dealer addresses — fetch them from /status.
 EID=demo-election
+ADDRS=$(for kid in 1 2 3; do
+  curl -s http://127.0.0.1:500$kid/status | python3 -c "import sys,json;print(json.load(sys.stdin)['address'])"
+done | python3 -c "import sys,json;print(json.dumps([l.strip() for l in sys.stdin]))")
+URLS='{"1":"http://127.0.0.1:5001","2":"http://127.0.0.1:5002","3":"http://127.0.0.1:5003"}'
+
 for kid in 1 2 3; do
   curl -X POST http://127.0.0.1:500$kid/dkg/round1 \
     -H "Content-Type: application/json" \
-    -d "{\"n\":3,\"t\":1,\"keyper_id\":$kid,\"bb_url\":\"http://127.0.0.1:5500\",\"election_id\":\"$EID\"}"
+    -d "{\"n\":3,\"t\":1,\"keyper_id\":$kid,\"election_id\":\"$EID\",\"members\":$ADDRS}"
+done
+for kid in 1 2 3; do
+  curl -X POST http://127.0.0.1:500$kid/dkg/distribute_commitments \
+    -H "Content-Type: application/json" \
+    -d "{\"keyper_urls\":$URLS}"
 done
 for kid in 1 2 3; do
   curl -X POST http://127.0.0.1:500$kid/dkg/distribute_shares \
     -H "Content-Type: application/json" \
-    -d '{"keyper_urls":{"1":"http://127.0.0.1:5001","2":"http://127.0.0.1:5002","3":"http://127.0.0.1:5003"}}'
+    -d "{\"keyper_urls\":$URLS}"
 done
 for kid in 1 2 3; do
   curl -X POST http://127.0.0.1:500$kid/dkg/round2 \
     -H "Content-Type: application/json" \
-    -d "{\"bb_url\":\"http://127.0.0.1:5500\",\"election_id\":\"$EID\"}"
+    -d "{\"election_id\":\"$EID\"}"
 done
 
 # Each keyper publishes the DKG result on chain.
@@ -232,8 +242,8 @@ cd src
 
 # 4a. On-chain pytest e2e (requires anvil + forge on PATH).
 # Spins up anvil once for the session; each test publishes a fresh
-# election and brings up its own bulletin board / keypers / proxy /
-# backend on free OS-allocated ports.
+# election and brings up its own keypers / WR oracle / vote proxy
+# on free OS-allocated ports. DKG runs P2P among the keypers.
 ../.venv/bin/python -m pytest tests/test_e2e_onchain.py -v
 
 # Covers:
@@ -308,8 +318,7 @@ abis/                       Vendored contract ABIs (see abis/README.md)
 fixtures/                   SDK-verified cross-impl test vectors
 scripts/gen_share_fixture.py  Regenerate fixtures from the live DKG
 src/
-  bulletin_board.py         DKG round-1 commitment log
-  keyper.py                 DKG + on-chain submitDecryptionShare
+  keyper.py                 DKG (signed P2P commitments + shares) + on-chain submitDecryptionShare
   backend.py                Off-chain Flask backend (legacy test path only)
   tally_aggregator.py       On-chain tally aggregator (library + CLI; PLAN.md decision E)
   vote_proxy.py             Dev-only ballot forwarder

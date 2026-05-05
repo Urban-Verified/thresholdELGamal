@@ -5,7 +5,7 @@ Drives the full Munich-shaped lifecycle against a live anvil node and the
 production contracts at https://github.com/Urban-Verified/bulletin-board:
 
     publishElection
-    → DKG (Feldman VSS via local bulletin_board.py per decision A)
+    → DKG (Feldman VSS via signed P2P keyper-to-keyper messages)
     → voteDKGResult per keyper
     → submitVote per ballot via vote_proxy.py
     → publishAggregate via tally_aggregator.aggregate (TALLY_AGGREGATOR_ROLE)
@@ -48,7 +48,6 @@ from chain_setup import (  # noqa: E402
     stop_anvil,
 )
 from eth_client import ElectionClient, EthChain  # noqa: E402
-from bulletin_board import create_bb_app  # noqa: E402
 from keyper import create_keyper_app  # noqa: E402
 from vote_proxy import create_vote_proxy_app  # noqa: E402
 from voter import cast_vote_via_proxy  # noqa: E402
@@ -170,11 +169,11 @@ class _OnChainDeployment:
     sc: _SessionChain
     election_address: str
     election: ElectionClient
-    bb_url: str
     keyper_urls: list[str]
+    keyper_addrs: list[str]
     proxy_url: str
     voting_end: int
-    bb_election_id: str
+    election_id_str: str
 
     def tally_signer(self):
         return Account.from_key(self.sc.tally_key)
@@ -190,25 +189,36 @@ class _OnChainDeployment:
         )
 
     def run_dkg(self) -> None:
+        url_map = {str(i + 1): self.keyper_urls[i] for i in range(len(self.keyper_urls))}
         for kid, url in zip([1, 2, 3], self.keyper_urls):
             r = requests.post(
                 f"{url}/dkg/round1",
-                json={"n": 3, "t": 1, "keyper_id": kid,
-                      "bb_url": self.bb_url, "election_id": self.bb_election_id},
+                json={
+                    "n": 3, "t": 1, "keyper_id": kid,
+                    "election_id": self.election_id_str,
+                    "members": self.keyper_addrs,
+                },
+                timeout=10,
+            ).json()
+            assert r.get("status") == "ok", r
+        for url in self.keyper_urls:
+            r = requests.post(
+                f"{url}/dkg/distribute_commitments",
+                json={"keyper_urls": url_map},
                 timeout=10,
             ).json()
             assert r.get("status") == "ok", r
         for url in self.keyper_urls:
             r = requests.post(
                 f"{url}/dkg/distribute_shares",
-                json={"keyper_urls": {str(i + 1): self.keyper_urls[i] for i in range(3)}},
+                json={"keyper_urls": url_map},
                 timeout=10,
             ).json()
             assert r.get("status") == "ok", r
         for url in self.keyper_urls:
             r = requests.post(
                 f"{url}/dkg/round2",
-                json={"bb_url": self.bb_url, "election_id": self.bb_election_id},
+                json={"election_id": self.election_id_str},
                 timeout=10,
             ).json()
             assert r.get("verified"), r
@@ -251,12 +261,9 @@ def _bring_up_election(sc: _SessionChain, *, num_candidates: int, budget: int,
         tally_aggregator=sc.tally, vote_proxy=sc.proxy_addr,
     )
 
-    bb_port = _free_port()
-    bb_url = f"http://127.0.0.1:{bb_port}"
-    _serve(create_bb_app(), bb_port)
-
     keyper_ports = [_free_port(), _free_port(), _free_port()]
     keyper_urls = [f"http://127.0.0.1:{p}" for p in keyper_ports]
+    keyper_addrs = [anvil_address(k) for k in sc.keyper_keys]
     for kid, port, key in zip([1, 2, 3], keyper_ports, sc.keyper_keys):
         _serve(
             create_keyper_app(kid, chain_config={"rpc_url": sc.rpc_url, "private_key": key}),
@@ -274,8 +281,8 @@ def _bring_up_election(sc: _SessionChain, *, num_candidates: int, budget: int,
     )
 
     # Wait for everything to be reachable. The on-chain test path doesn't
-    # need backend.py at all — tally aggregation is a library call now.
-    _wait_http(f"{bb_url}/bb/status")
+    # need a Flask backend — DKG runs P2P among keypers, tally aggregation
+    # is a library call.
     for url in keyper_urls:
         _wait_http(f"{url}/status")
     _wait_http(f"{proxy_url}/status")
@@ -284,11 +291,11 @@ def _bring_up_election(sc: _SessionChain, *, num_candidates: int, budget: int,
         sc=sc,
         election_address=election_address,
         election=ElectionClient(sc.chain, election_address),
-        bb_url=bb_url,
         keyper_urls=keyper_urls,
+        keyper_addrs=keyper_addrs,
         proxy_url=proxy_url,
         voting_end=voting_end,
-        bb_election_id=f"test-{election_address[2:10]}",  # unique BB topic per election
+        election_id_str=f"test-{election_address[2:10]}",
     )
 
 
@@ -368,25 +375,32 @@ def test_late_keyper_dkg_vote_no_ops(session_chain: _SessionChain) -> None:
     rather than an error).
     """
     dep = _bring_up_election(session_chain, num_candidates=3, budget=1)
-    # Run DKG round-1/round-2 manually so we control the on-chain submit order.
+    # Run DKG round-1 → P2P fan-out → round-2 manually so we can drive
+    # the on-chain submission ordering for this test.
+    url_map = {str(i + 1): dep.keyper_urls[i] for i in range(3)}
     for kid, url in zip([1, 2, 3], dep.keyper_urls):
         r = requests.post(
             f"{url}/dkg/round1",
             json={"n": 3, "t": 1, "keyper_id": kid,
-                  "bb_url": dep.bb_url, "election_id": dep.bb_election_id},
+                  "election_id": dep.election_id_str,
+                  "members": dep.keyper_addrs},
             timeout=10,
         ).json()
         assert r.get("status") == "ok", r
     for url in dep.keyper_urls:
         requests.post(
+            f"{url}/dkg/distribute_commitments",
+            json={"keyper_urls": url_map}, timeout=10,
+        ).json()
+    for url in dep.keyper_urls:
+        requests.post(
             f"{url}/dkg/distribute_shares",
-            json={"keyper_urls": {str(i + 1): dep.keyper_urls[i] for i in range(3)}},
-            timeout=10,
+            json={"keyper_urls": url_map}, timeout=10,
         ).json()
     for url in dep.keyper_urls:
         assert requests.post(
             f"{url}/dkg/round2",
-            json={"bb_url": dep.bb_url, "election_id": dep.bb_election_id},
+            json={"election_id": dep.election_id_str},
             timeout=10,
         ).json().get("verified")
 

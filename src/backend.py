@@ -26,14 +26,34 @@ import threading
 import requests
 from flask import Flask, request, jsonify
 
+from eth_account import Account
+from eth_account.messages import encode_defunct
+from eth_utils import keccak
+
 from crypto.primitives import (
     CURVE_ORDER, G2, Z2,
     point_to_dict, dict_to_point, validate_g2_point,
     point_add, point_multiply, point_eq, is_identity,
+    g2_to_compressed,
 )
 from crypto.elgamal import aggregate_ciphertexts, threshold_decrypt
 from crypto.proofs import verify_range, verify_exact_budget, verify_decryption_share
-from bulletin_board import BBClient
+
+
+# ----------------------------------------------------------------------
+#  Reveal-payload signature verification (matches keyper.py:_reveal_payload_hash)
+# ----------------------------------------------------------------------
+
+def _reveal_payload_hash(election_id: str, dealer_id: int, recipient_id: int, share: int) -> bytes:
+    parts = [
+        b"DKG-REVEAL-v1",
+        len(election_id).to_bytes(4, "big"),
+        election_id.encode("utf-8"),
+        dealer_id.to_bytes(8, "big"),
+        recipient_id.to_bytes(8, "big"),
+        (share % CURVE_ORDER).to_bytes(32, "big"),
+    ]
+    return keccak(b"".join(parts))
 
 
 def _parse_scalar(value):
@@ -47,7 +67,7 @@ def _parse_scalar(value):
     return n
 
 
-def create_backend_app(keyper_urls, bb_url):
+def create_backend_app(keyper_urls):
     """Create the off-chain election backend Flask app.
 
     On-chain tally aggregation lives in ``src/tally_aggregator.py`` (see
@@ -56,7 +76,6 @@ def create_backend_app(keyper_urls, bb_url):
     exercises; they are not used by the on-chain pipeline.
     """
     app = Flask("election_backend")
-    bb = BBClient(bb_url)
 
     # Election state (protected by lock for thread safety)
     state = {
@@ -139,7 +158,19 @@ def create_backend_app(keyper_urls, bb_url):
         n, t = state["n"], state["t"]
         urls = state["keyper_urls"][:n]
         election_id = state["election_id"]
-        commit_topic = f"dkg/{election_id}/commitments"
+
+        # Pre-flight: every keyper publishes its signing address via /status.
+        # Backend collects them so it can hand the full ``members`` list to
+        # each keyper at round-1 time and so it can verify ``reveal_share``
+        # signatures during complaint resolution.
+        try:
+            members = []
+            for kid in range(1, n + 1):
+                resp = requests.get(f"{urls[kid - 1]}/status", timeout=10)
+                resp.raise_for_status()
+                members.append(resp.json()["address"])
+        except Exception as e:
+            return jsonify({"error": f"Failed to collect keyper addresses: {e}"}), 500
 
         # Track which keyper IDs are still participating
         active_kids = set(range(1, n + 1))
@@ -152,35 +183,31 @@ def create_backend_app(keyper_urls, bb_url):
                     "error": f"DKG failed: only {active_n} honest keypers remain, need at least {t + 1}",
                 }), 500
 
-            # Build keyper URL map for active keypers only
+            # Build keyper URL map for active keypers only.
             keyper_url_map = {kid: urls[kid - 1] for kid in active_kids}
+            active_members = [members[kid - 1] for kid in sorted(active_kids)]
 
             # --- Round 1: each keyper generates polynomial + commitments ---
-            # Keypers post commitments to the bulletin board (not to us).
+            # Commitments come back in the response so the backend can build
+            # its own off-chain view (replaces the bulletin-board read).
+            all_commitments_dicts = {}
+            all_commitments_points = {}
             for kid in sorted(active_kids):
                 url = keyper_url_map[kid]
                 try:
                     resp = requests.post(f"{url}/dkg/round1", json={
                         "n": active_n, "t": t, "keyper_id": kid,
-                        "bb_url": bb_url,
                         "election_id": election_id,
+                        "members": active_members,
                     }, timeout=30)
                     resp.raise_for_status()
                     r1 = resp.json()
                     if r1.get("error"):
                         return jsonify({"error": f"DKG Round 1 failed for keyper {kid}: {r1['error']}"}), 500
+                    comms_dicts = r1["commitments"]
                 except Exception as e:
                     return jsonify({"error": f"DKG Round 1 failed for keyper {kid}: {e}"}), 500
 
-            # Read all commitments from the bulletin board
-            raw_entries = bb.read_topic(commit_topic)
-            all_commitments_dicts = {}
-            all_commitments_points = {}
-            for kid in sorted(active_kids):
-                kid_str = str(kid)
-                if kid_str not in raw_entries:
-                    return jsonify({"error": f"Keyper {kid} did not post commitments to bulletin board"}), 500
-                comms_dicts = raw_entries[kid_str]
                 comms_points = []
                 for c_dict in comms_dicts:
                     try:
@@ -192,10 +219,19 @@ def create_backend_app(keyper_urls, bb_url):
                 all_commitments_dicts[kid] = comms_dicts
                 all_commitments_points[kid] = comms_points
 
-            # Freeze the commitment topic and get digest for cross-verification
-            commitment_digest = bb.freeze(commit_topic)
+            # --- Commitment fan-out: each keyper signs its commitments and
+            # sends them P2P to every other active keyper. ---
+            for kid in sorted(active_kids):
+                url = keyper_url_map[kid]
+                try:
+                    resp = requests.post(f"{url}/dkg/distribute_commitments", json={
+                        "keyper_urls": {str(k): v for k, v in keyper_url_map.items()},
+                    }, timeout=60)
+                    resp.raise_for_status()
+                except Exception as e:
+                    return jsonify({"error": f"DKG commitment distribution failed for keyper {kid}: {e}"}), 500
 
-            # --- Share distribution: keypers send shares P2P ---
+            # --- Share distribution: keypers send signed shares P2P ---
             for kid in sorted(active_kids):
                 url = keyper_url_map[kid]
                 try:
@@ -206,17 +242,14 @@ def create_backend_app(keyper_urls, bb_url):
                 except Exception as e:
                     return jsonify({"error": f"DKG share distribution failed for keyper {kid}: {e}"}), 500
 
-            # --- Round 2: verify shares, collect complaints ---
-            # Keypers read commitments from the BB themselves and verify the digest.
+            # --- Round 2: verify locally against received commitments ---
             round2_results = {}
             all_complaints = {}  # {complainer_kid: [bad_dealer_ids]}
             for kid in sorted(active_kids):
                 url = keyper_url_map[kid]
                 try:
                     resp = requests.post(f"{url}/dkg/round2", json={
-                        "bb_url": bb_url,
                         "election_id": election_id,
-                        "expected_digest": commitment_digest,
                     }, timeout=30)
                     resp.raise_for_status()
                     r2 = resp.json()
@@ -235,11 +268,11 @@ def create_backend_app(keyper_urls, bb_url):
                 break
 
             # --- Complaint resolution (Feldman VSS rebuttal) ---
-            # For each complaint, ask the accused dealer to reveal the disputed
-            # share. Then verify it against the dealer's published commitments:
-            #   share · P₂ == Σⱼ (complainer_id^j mod q) · γⱼ
-            # If it verifies → the complainer lied → exclude the complainer.
-            # If it doesn't verify → the dealer sent a bad share → exclude the dealer.
+            # The dealer's signature on the revealed share binds it to
+            # ``(electionId, dealer_id, recipient_id, share)`` — the same
+            # payload the recipient would have received in /dkg/receive_share.
+            # We verify the signature recovers to the dealer's keyper-set
+            # member address before re-checking against the commitments.
             excluded = set()
             for complainer_kid, accused_dealers in all_complaints.items():
                 if complainer_kid in excluded:
@@ -247,7 +280,6 @@ def create_backend_app(keyper_urls, bb_url):
                 for dealer_kid in accused_dealers:
                     if dealer_kid in excluded:
                         continue
-                    # Ask the dealer to reveal the share for the complainer
                     dealer_url = keyper_url_map[dealer_kid]
                     try:
                         resp = requests.post(f"{dealer_url}/dkg/reveal_share", json={
@@ -256,13 +288,29 @@ def create_backend_app(keyper_urls, bb_url):
                         resp.raise_for_status()
                         revealed = resp.json()
                         revealed_share = int(revealed["share"])
+                        sig_hex = revealed["signature"]
                     except Exception:
-                        # Dealer refuses or fails to reveal → treat as guilty
                         excluded.add(dealer_kid)
                         print(f"[Backend] Dealer {dealer_kid} refused to reveal share for keyper {complainer_kid} — excluding dealer")
                         continue
 
-                    # Verify the revealed share against the dealer's commitments
+                    # Verify the dealer signed the reveal payload.
+                    payload_hash = _reveal_payload_hash(
+                        election_id, dealer_kid, complainer_kid, revealed_share,
+                    )
+                    try:
+                        recovered = Account.recover_message(
+                            encode_defunct(primitive=payload_hash),
+                            signature=bytes.fromhex(sig_hex.removeprefix("0x")),
+                        )
+                    except Exception:
+                        recovered = None
+                    if recovered is None or recovered.lower() != members[dealer_kid - 1].lower():
+                        excluded.add(dealer_kid)
+                        print(f"[Backend] Bad signature on dealer {dealer_kid}'s reveal — excluding dealer")
+                        continue
+
+                    # Verify the revealed share against the dealer's commitments.
                     comms = all_commitments_points[dealer_kid]
                     expected_pt = Z2
                     x_power = 1
@@ -272,12 +320,10 @@ def create_backend_app(keyper_urls, bb_url):
                     actual_pt = point_multiply(G2, revealed_share)
 
                     if point_eq(expected_pt, actual_pt):
-                        # Share verifies → complainer filed a false complaint
                         excluded.add(complainer_kid)
                         print(f"[Backend] Complaint by keyper {complainer_kid} against dealer {dealer_kid} is FALSE — excluding complainer")
-                        break  # complainer excluded, skip their other complaints
+                        break
                     else:
-                        # Share doesn't verify → dealer is guilty
                         excluded.add(dealer_kid)
                         print(f"[Backend] Complaint by keyper {complainer_kid} against dealer {dealer_kid} is VALID — excluding dealer")
 
@@ -334,7 +380,6 @@ def create_backend_app(keyper_urls, bb_url):
             "phase": "voting",
             "mpk": point_to_dict(mpk),
             "mpk_shares": {str(k): point_to_dict(v) for k, v in mpk_shares.items()},
-            "commitment_digest": commitment_digest,
         })
 
     # ------------------------------------------------------------------
@@ -611,15 +656,12 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
     parser.add_argument("--keyper-urls", required=True,
                         help="Comma-separated list of keyper URLs")
-    parser.add_argument("--bb-url", required=True,
-                        help="Bulletin board server URL")
     args = parser.parse_args()
 
     keyper_urls = [u.strip() for u in args.keyper_urls.split(",")]
-    app = create_backend_app(keyper_urls, args.bb_url)
+    app = create_backend_app(keyper_urls)
     print(f"[Backend] Starting on {args.host}:{args.port}")
     print(f"[Backend] Keyper URLs: {keyper_urls}")
-    print(f"[Backend] Bulletin Board: {args.bb_url}")
     print("[Backend] Off-chain only — on-chain tally lives in tally_aggregator.py")
     app.run(host=args.host, port=args.port, debug=False, use_reloader=False)
 

@@ -15,11 +15,16 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
 import requests
 from flask import Flask, request, jsonify
+
+from eth_account import Account
+from eth_account.messages import encode_defunct
+from eth_utils import keccak
 
 from crypto.primitives import (
     point_to_dict, dict_to_point, CURVE_ORDER,
@@ -28,96 +33,296 @@ from crypto.primitives import (
 )
 from crypto.dkg import KeyperDKGState, derive_joint_mpk, derive_mpk_share
 from crypto.proofs import prove_decryption_share
-from bulletin_board import BBClient
 import sdk_compat
 
 
-def create_keyper_app(keyper_id, *, chain_config=None):
+# ----------------------------------------------------------------------
+#  P2P signed-message helpers
+#
+#  Every keyper-to-keyper DKG message (commitments, shares, share
+#  reveals during complaint resolution) is signed with the dealer's
+#  Ethereum keyper key. Receivers verify the signature against the
+#  member address at the dealer's index in ``KeyperSet`` (passed in via
+#  /dkg/round1). Replaces the old anti-equivocation guarantee that the
+#  bulletin board provided.
+# ----------------------------------------------------------------------
+
+_DST_COMMITMENTS = b"DKG-COMMITMENTS-v1"
+_DST_SHARE = b"DKG-SHARE-v1"
+_DST_REVEAL = b"DKG-REVEAL-v1"
+
+
+def _commitments_payload_hash(election_id: str, dealer_id: int, commitments) -> bytes:
+    parts = [
+        _DST_COMMITMENTS,
+        len(election_id).to_bytes(4, "big"),
+        election_id.encode("utf-8"),
+        dealer_id.to_bytes(8, "big"),
+        len(commitments).to_bytes(4, "big"),
+    ]
+    for c in commitments:
+        parts.append(g2_to_compressed(c))
+    return keccak(b"".join(parts))
+
+
+def _share_payload_hash(election_id: str, dealer_id: int, recipient_id: int, share: int) -> bytes:
+    parts = [
+        _DST_SHARE,
+        len(election_id).to_bytes(4, "big"),
+        election_id.encode("utf-8"),
+        dealer_id.to_bytes(8, "big"),
+        recipient_id.to_bytes(8, "big"),
+        (share % CURVE_ORDER).to_bytes(32, "big"),
+    ]
+    return keccak(b"".join(parts))
+
+
+def _reveal_payload_hash(election_id: str, dealer_id: int, recipient_id: int, share: int) -> bytes:
+    parts = [
+        _DST_REVEAL,
+        len(election_id).to_bytes(4, "big"),
+        election_id.encode("utf-8"),
+        dealer_id.to_bytes(8, "big"),
+        recipient_id.to_bytes(8, "big"),
+        (share % CURVE_ORDER).to_bytes(32, "big"),
+    ]
+    return keccak(b"".join(parts))
+
+
+def _sign(private_key: str, payload_hash: bytes) -> str:
+    """EIP-191 personal-sign over a 32-byte payload hash; returns hex sig."""
+    acct = Account.from_key(private_key)
+    msg = encode_defunct(primitive=payload_hash)
+    signed = acct.sign_message(msg)
+    return signed.signature.hex()
+
+
+def _recover(payload_hash: bytes, signature_hex: str) -> str:
+    msg = encode_defunct(primitive=payload_hash)
+    return Account.recover_message(msg, signature=bytes.fromhex(signature_hex.removeprefix("0x")))
+
+
+def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
     """Create a Flask app for a single keyper.
 
     ``chain_config`` is an optional dict ``{"rpc_url": str, "private_key": str}``
-    that enables the on-chain DKG-publication endpoint. Without it, the
-    keyper still participates in the off-chain DKG dance but cannot submit
-    ``voteDKGResult``.
+    that enables the on-chain DKG-publication endpoint.
+
+    ``signing_key`` is the Ethereum private key used to sign P2P DKG
+    messages (commitments, shares, reveals). If omitted but
+    ``chain_config`` is provided, the chain key doubles as the signing
+    key. If neither is provided, a deterministic key is derived from
+    ``keyper_id`` so off-chain dev runs and tests still work.
     """
+    if signing_key is None:
+        if chain_config is not None:
+            signing_key = chain_config["private_key"]
+        else:
+            # Deterministic dev fallback so off-chain test runs work
+            # without explicit chain config.
+            seed = hashlib.sha256(f"keyper-{keyper_id}".encode()).digest()
+            signing_key = "0x" + seed.hex()
+    signing_address = Account.from_key(signing_key).address
+
     app = Flask(f"keyper_{keyper_id}")
     dkg_state = KeyperDKGState()
-    keyper_meta = {"id": keyper_id, "chain_config": chain_config}
-    # Stores shares generated in round1 for peer-to-peer distribution
-    pending_shares = {}
-    # Stores shares received from other keypers via peer-to-peer
-    received_shares = {}
+    keyper_meta = {
+        "id": keyper_id,
+        "chain_config": chain_config,
+        "signing_key": signing_key,
+        "signing_address": signing_address,
+    }
+    # Per-DKG context: members[i] is the eth address of keyper id i+1 in
+    # the KeyperSet, used to verify P2P signatures from that dealer. The
+    # election_id scopes the signed payload to a specific DKG instance.
+    dkg_meta = {"election_id": None, "members": []}
+    # Local share storage (P2P).
+    pending_shares = {}            # generated by us in round1, indexed by recipient_id
+    received_shares = {}           # received from other keypers, indexed by dealer_id
+    received_commitments = {}      # received commitments from peers, indexed by dealer_id
     # Snapshot of the commitments + dealer set used in the most recent
     # round-2 success. Reused by ``/dkg/publish_on_chain`` so the keyper
     # publishes the same DKG result it locally validated.
     last_round2 = {"all_commitments": None, "active_dealers": None}
 
+    def _members_addr(dealer_id: int) -> str | None:
+        idx = dealer_id - 1
+        if 0 <= idx < len(dkg_meta["members"]):
+            return dkg_meta["members"][idx]
+        return None
+
     @app.route("/status", methods=["GET"])
     def status():
         return jsonify({
             "keyper_id": keyper_meta["id"],
+            "address": keyper_meta["signing_address"],
             "dkg_completed": dkg_state.combined_share is not None,
             "public_key_share": point_to_dict(dkg_state.public_key_share) if dkg_state.public_key_share else None,
         })
 
     @app.route("/dkg/round1", methods=["POST"])
     def dkg_round1():
-        """DKG Round 1: Generate secret, polynomial, commitments, and shares.
+        """DKG Round 1: generate polynomial, commitments, and shares locally.
 
-        Posts commitments to the bulletin board (not returned to backend).
-        Shares are kept locally for peer-to-peer distribution.
+        Replaces the bulletin-board-anchored flow: commitments are kept
+        locally and fanned out P2P via /dkg/distribute_commitments. The
+        request body must include the keyper-set ``members`` (eth
+        addresses, in member-index order) so this keyper can verify
+        signatures on incoming P2P messages from other dealers.
         """
         data = request.get_json()
         n = int(data["n"])
         t = int(data["t"])
         kid = int(data["keyper_id"])
-        bb_url = data["bb_url"]
         election_id = data["election_id"]
+        members = data.get("members", [])
 
         if kid != keyper_meta["id"]:
             return jsonify({"error": f"Keyper ID mismatch: configured as {keyper_meta['id']}, received {kid}"}), 400
+        if not isinstance(members, list) or len(members) != n:
+            return jsonify({"error": f"members must be a list of {n} addresses, got {len(members)}"}), 400
 
+        # Reset DKG state for this fresh run.
         commitments, shares = dkg_state.round1(kid, n, t)
-
-        # Store shares locally for peer-to-peer delivery
         pending_shares.clear()
         pending_shares.update(shares)
         received_shares.clear()
+        received_commitments.clear()
+        # Our own commitments count as received from ourselves.
+        received_commitments[kid] = list(commitments)
 
-        # Post commitments to the bulletin board (anti-equivocation)
-        bb = BBClient(bb_url)
-        comms_dicts = [point_to_dict(c) for c in commitments]
-        ok = bb.post(f"dkg/{election_id}/commitments", str(kid), comms_dicts)
-        if not ok:
-            return jsonify({"error": "Failed to post commitments to bulletin board"}), 500
+        # Pin the DKG context so subsequent endpoints can verify
+        # signatures and reject messages from other elections.
+        dkg_meta["election_id"] = election_id
+        # ``members`` are 0x-prefixed mixed-case checksummed strings; the
+        # ``Account.recover_message`` return matches that shape, and we
+        # compare case-insensitively in the verify path anyway.
+        dkg_meta["members"] = list(members)
 
         return jsonify({
             "keyper_id": kid,
             "status": "ok",
-            # Commitments are on the bulletin board, not returned here
+            # Backend gets our commitments via the response so it can build
+            # its own off-chain view (used for off-chain mpk derivation and
+            # cross-checking what each keyper reports it received).
+            "commitments": [point_to_dict(c) for c in commitments],
         })
 
-    @app.route("/dkg/distribute_shares", methods=["POST"])
-    def distribute_shares():
-        """Send our secret shares directly to each recipient keyper (peer-to-peer).
+    @app.route("/dkg/distribute_commitments", methods=["POST"])
+    def distribute_commitments():
+        """Send our round-1 commitments to every other keyper, signed.
 
-        The backend provides keyper URLs but never sees the shares.
+        Each peer's /dkg/receive_commitments verifies the signature
+        against ``KeyperSet.getMember(kid - 1)``, replacing the bulletin
+        board's anti-equivocation guarantee with a per-message
+        unforgeability one. Equivocation across recipients still requires
+        the dealer to produce two different signed messages for two
+        different views — a real-time receiver-side cross-check (phase 2)
+        would catch that locally; for phase 1 the on-chain
+        ``voteDKGResult`` threshold-vote does so by failing to finalize.
         """
         data = request.get_json()
-        keyper_urls = data["keyper_urls"]  # {keyper_id_str: url}
+        keyper_urls = data["keyper_urls"]   # {keyper_id_str: url}
         kid = keyper_meta["id"]
+
+        if dkg_meta["election_id"] is None:
+            return jsonify({"error": "Run /dkg/round1 first"}), 400
+
+        commitments = dkg_state.commitments
+        payload_hash = _commitments_payload_hash(dkg_meta["election_id"], kid, commitments)
+        signature = _sign(keyper_meta["signing_key"], payload_hash)
+        body = {
+            "election_id": dkg_meta["election_id"],
+            "dealer_id": kid,
+            "commitments": [point_to_dict(c) for c in commitments],
+            "signature": signature,
+        }
 
         for recipient_id_str, url in keyper_urls.items():
             recipient_id = int(recipient_id_str)
             if recipient_id == kid:
-                # Deliver our own share locally
-                received_shares[kid] = pending_shares[kid]
-                continue
+                continue   # we already have our own
+            try:
+                resp = requests.post(f"{url}/dkg/receive_commitments", json=body, timeout=10)
+                resp.raise_for_status()
+            except Exception as e:
+                return jsonify({
+                    "error": f"Failed to send commitments to keyper {recipient_id}: {e}",
+                }), 500
+
+        return jsonify({"status": "ok"})
+
+    @app.route("/dkg/receive_commitments", methods=["POST"])
+    def receive_commitments():
+        """Receive signed commitments from another keyper.
+
+        Append-only: a second post from the same dealer is rejected so a
+        real dealer that posted first cannot be overwritten by a later
+        forgery (the signature check below already rules out forgeries
+        from non-dealer parties).
+        """
+        data = request.get_json()
+        try:
+            election_id = data["election_id"]
+            dealer_id = int(data["dealer_id"])
+            commitments_dicts = data["commitments"]
+            sig_hex = data["signature"]
+        except (KeyError, ValueError, TypeError) as e:
+            return jsonify({"error": f"Bad request: {e}"}), 400
+
+        if election_id != dkg_meta.get("election_id"):
+            return jsonify({"error": "Election ID mismatch"}), 400
+        if dealer_id in received_commitments:
+            return jsonify({"error": "Commitments already received from this dealer"}), 409
+
+        try:
+            commitments = [dict_to_point(c) for c in commitments_dicts]
+        except Exception as e:
+            return jsonify({"error": f"Invalid commitment point: {e}"}), 400
+
+        expected = _members_addr(dealer_id)
+        if expected is None:
+            return jsonify({"error": f"Unknown dealer_id {dealer_id}"}), 400
+        payload_hash = _commitments_payload_hash(election_id, dealer_id, commitments)
+        try:
+            recovered = _recover(payload_hash, sig_hex)
+        except Exception as e:
+            return jsonify({"error": f"Signature recover failed: {e}"}), 401
+        if recovered.lower() != expected.lower():
+            return jsonify({
+                "error": f"Bad signature: expected {expected}, recovered {recovered}",
+            }), 401
+
+        received_commitments[dealer_id] = commitments
+        return jsonify({"status": "ok"})
+
+    @app.route("/dkg/distribute_shares", methods=["POST"])
+    def distribute_shares():
+        """Send our secret shares directly to each recipient keyper, signed."""
+        data = request.get_json()
+        keyper_urls = data["keyper_urls"]   # {keyper_id_str: url}
+        kid = keyper_meta["id"]
+
+        if dkg_meta["election_id"] is None:
+            return jsonify({"error": "Run /dkg/round1 first"}), 400
+
+        for recipient_id_str, url in keyper_urls.items():
+            recipient_id = int(recipient_id_str)
             share_val = pending_shares[recipient_id]
+            if recipient_id == kid:
+                received_shares[kid] = share_val
+                continue
+            payload_hash = _share_payload_hash(
+                dkg_meta["election_id"], kid, recipient_id, share_val,
+            )
+            signature = _sign(keyper_meta["signing_key"], payload_hash)
             try:
                 resp = requests.post(f"{url}/dkg/receive_share", json={
+                    "election_id": dkg_meta["election_id"],
                     "dealer_id": kid,
+                    "recipient_id": recipient_id,
                     "share": str(share_val),
+                    "signature": signature,
                 }, timeout=10)
                 resp.raise_for_status()
             except Exception as e:
@@ -127,72 +332,95 @@ def create_keyper_app(keyper_id, *, chain_config=None):
 
     @app.route("/dkg/receive_share", methods=["POST"])
     def receive_share():
-        """Receive a secret share from another keyper (peer-to-peer).
+        """Receive a signed secret share from another keyper.
 
-        Append-only: rejects a second share from the same dealer to prevent
-        unauthenticated overwrite attacks (audit issue #1).
+        Append-only per dealer; signature is checked against the dealer's
+        keyper-set member address.
         """
         data = request.get_json()
-        dealer_id = int(data["dealer_id"])
-        share = int(data["share"])
+        try:
+            election_id = data["election_id"]
+            dealer_id = int(data["dealer_id"])
+            recipient_id = int(data["recipient_id"])
+            share = int(data["share"])
+            sig_hex = data["signature"]
+        except (KeyError, ValueError, TypeError) as e:
+            return jsonify({"error": f"Bad request: {e}"}), 400
+
+        if election_id != dkg_meta.get("election_id"):
+            return jsonify({"error": "Election ID mismatch"}), 400
+        if recipient_id != keyper_meta["id"]:
+            return jsonify({"error": f"Recipient mismatch: this is keyper {keyper_meta['id']}"}), 400
         if share < 0 or share >= CURVE_ORDER:
             return jsonify({"error": "Share value out of scalar field range"}), 400
         if dealer_id in received_shares:
             return jsonify({"error": "Share already received from this dealer"}), 409
+
+        expected = _members_addr(dealer_id)
+        if expected is None:
+            return jsonify({"error": f"Unknown dealer_id {dealer_id}"}), 400
+        payload_hash = _share_payload_hash(election_id, dealer_id, recipient_id, share)
+        try:
+            recovered = _recover(payload_hash, sig_hex)
+        except Exception as e:
+            return jsonify({"error": f"Signature recover failed: {e}"}), 401
+        if recovered.lower() != expected.lower():
+            return jsonify({
+                "error": f"Bad signature: expected {expected}, recovered {recovered}",
+            }), 401
+
         received_shares[dealer_id] = share
         return jsonify({"status": "ok"})
 
     @app.route("/dkg/reveal_share", methods=["POST"])
     def reveal_share():
-        """Reveal the share this dealer generated for a specific recipient.
+        """Signed Feldman-VSS rebuttal: dealer publicly reveals the share
+        it generated for a specific recipient.
 
-        Used during complaint resolution (Feldman VSS rebuttal): the backend
-        asks the accused dealer to publicly reveal the share it computed for
-        the complaining keyper. All participants can then verify the share
-        against the dealer's published commitments to determine who is at fault.
+        Backend collects the reveal and the dealer's commitments and
+        independently checks ``share · P₂ == Σⱼ recipient^j · γⱼ``. If
+        the equation holds, the complaining keyper lied; otherwise the
+        dealer did. The signature is bound to the same payload format the
+        recipient would have received in /dkg/receive_share.
         """
         data = request.get_json()
-        recipient_id = int(data["recipient_id"])
+        try:
+            recipient_id = int(data["recipient_id"])
+        except (KeyError, ValueError, TypeError) as e:
+            return jsonify({"error": f"Bad request: {e}"}), 400
         if recipient_id not in pending_shares:
             return jsonify({"error": f"No pending share for recipient {recipient_id}"}), 404
+
+        kid = keyper_meta["id"]
+        share = pending_shares[recipient_id]
+        payload_hash = _reveal_payload_hash(
+            dkg_meta["election_id"], kid, recipient_id, share,
+        )
+        signature = _sign(keyper_meta["signing_key"], payload_hash)
+
         return jsonify({
-            "dealer_id": keyper_meta["id"],
+            "dealer_id": kid,
             "recipient_id": recipient_id,
-            "share": str(pending_shares[recipient_id]),
+            "election_id": dkg_meta["election_id"],
+            "share": str(share),
+            "signature": signature,
+            "signing_address": keyper_meta["signing_address"],
         })
 
     @app.route("/dkg/round2", methods=["POST"])
     def dkg_round2():
-        """DKG Round 2: Verify received shares and compute combined secret share.
+        """DKG Round 2: verify received shares and compute combined secret share.
 
-        Reads commitments from the bulletin board (same view as everyone).
-        Verifies the board digest matches the expected value to detect tampering.
+        All commitments come from local state populated by
+        /dkg/receive_commitments — the bulletin board is gone.
         """
-        data = request.get_json()
-        bb_url = data["bb_url"]
-        election_id = data["election_id"]
-        expected_digest = data.get("expected_digest")
+        data = request.get_json() or {}
+        # ``data`` may carry an election_id for cross-checking; not strictly
+        # required since round 1 already pinned it.
+        if data.get("election_id") and data["election_id"] != dkg_meta.get("election_id"):
+            return jsonify({"error": "Election ID mismatch"}), 400
 
-        # Read commitments from the bulletin board (anti-equivocation)
-        bb = BBClient(bb_url)
-        topic = f"dkg/{election_id}/commitments"
-
-        # Verify digest if provided (cross-check with what backend computed)
-        if expected_digest:
-            actual_digest = bb.get_digest(topic)
-            if actual_digest != expected_digest:
-                return jsonify({
-                    "keyper_id": keyper_meta["id"],
-                    "verified": False,
-                    "error": f"Bulletin board digest mismatch: expected {expected_digest}, got {actual_digest}",
-                }), 200
-
-        raw_entries = bb.read_topic(topic)
-
-        # Parse commitments: {dealer_id_str: [G2 point dicts, ...]}
-        all_commitments = {}
-        for dealer_id_str, comms in raw_entries.items():
-            all_commitments[int(dealer_id_str)] = [dict_to_point(c) for c in comms]
+        all_commitments = dict(received_commitments)
 
         try:
             combined_share, public_key_share = dkg_state.round2(all_commitments, received_shares)
@@ -452,9 +680,12 @@ def main():
     if args.rpc_url and private_key:
         chain_config = {"rpc_url": args.rpc_url, "private_key": private_key}
 
-    app = create_keyper_app(args.id, chain_config=chain_config)
+    # Same key signs both the chain transactions and the P2P DKG messages
+    # so the recovered address matches the KeyperSet member entry.
+    app = create_keyper_app(args.id, chain_config=chain_config, signing_key=private_key)
     suffix = " [chain enabled]" if chain_config else ""
     print(f"[Keyper {args.id}] Starting on {args.host}:{args.port}{suffix}")
+    print(f"[Keyper {args.id}] Signing address: {Account.from_key(private_key).address if private_key else '(deterministic dev key)'}")
     app.run(host=args.host, port=args.port, debug=False, use_reloader=False)
 
 

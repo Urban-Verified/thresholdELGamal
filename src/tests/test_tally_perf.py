@@ -19,7 +19,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from keyper import create_keyper_app
 from backend import create_backend_app
-from bulletin_board import create_bb_app
 from crypto.primitives import point_to_dict, dict_to_point
 from crypto.elgamal import encrypt
 
@@ -31,9 +30,6 @@ THRESHOLD = 1
 
 BACKEND_PORT = 9500
 KEYPER_BASE_PORT = 9501
-BB_PORT = 9599
-
-
 def start_flask(app, port):
     t = threading.Thread(
         target=lambda: app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False),
@@ -56,12 +52,9 @@ def wait_for(url, retries=40, delay=0.25):
 def main():
     random.seed(42)
     backend_url = f"http://127.0.0.1:{BACKEND_PORT}"
-    bb_url = f"http://127.0.0.1:{BB_PORT}"
 
     # --- Start servers ---
     print(f"Starting {N_KEYPERS} keypers, bulletin board, and backend...", flush=True)
-    bb_app = create_bb_app()
-    start_flask(bb_app, BB_PORT)
 
     keyper_urls = []
     for i in range(N_KEYPERS):
@@ -70,10 +63,9 @@ def main():
         start_flask(app, port)
         keyper_urls.append(f"http://127.0.0.1:{port}")
 
-    backend_app = create_backend_app(keyper_urls, bb_url)
+    backend_app = create_backend_app(keyper_urls)
     start_flask(backend_app, BACKEND_PORT)
 
-    assert wait_for(f"{bb_url}/bb/status"), "Bulletin board not ready"
     for url in keyper_urls:
         assert wait_for(f"{url}/status"), f"Keyper {url} not ready"
     assert wait_for(f"{backend_url}/election/status"), "Backend not ready"

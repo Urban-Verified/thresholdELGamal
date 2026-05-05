@@ -23,7 +23,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from keyper import create_keyper_app
 from backend import create_backend_app
-from bulletin_board import create_bb_app
 from crypto.primitives import (
     CURVE_ORDER, G2, Z2,
     point_to_dict, dict_to_point,
@@ -42,13 +41,12 @@ _PORT_COUNTER = [7000]  # shared mutable for unique port allocation
 
 
 def _next_ports(n_keypers):
-    """Allocate unique ports: (backend_port, keyper_ports_list, bb_port)."""
+    """Allocate unique ports: (backend_port, keyper_ports_list)."""
     base = _PORT_COUNTER[0]
-    _PORT_COUNTER[0] += n_keypers + 2
+    _PORT_COUNTER[0] += n_keypers + 1
     backend_port = base
     keyper_ports = [base + 1 + i for i in range(n_keypers)]
-    bb_port = base + 1 + n_keypers
-    return backend_port, keyper_ports, bb_port
+    return backend_port, keyper_ports
 
 
 def start_flask_in_thread(app, port, host="127.0.0.1"):
@@ -119,58 +117,136 @@ def submit_vote(backend_url, vote_vector):
 # =========================================================================
 
 class TestShareOverwriteProtection(unittest.TestCase):
-    """Audit fix #1: receive_share must reject a second share from the same dealer."""
+    """Audit fix #1 (signed-P2P era): receive_share must reject a second
+    share from the same dealer (append-only) AND must reject any forged
+    or unsigned message regardless of order.
+    """
 
     @classmethod
     def setUpClass(cls):
-        cls.keyper_port = _next_ports(1)[1][0]
-        cls.app = create_keyper_app(1)
-        start_flask_in_thread(cls.app, cls.keyper_port)
-        cls.keyper_url = f"http://127.0.0.1:{cls.keyper_port}"
-        assert wait_for_server(f"{cls.keyper_url}/status"), "Keyper not ready"
+        # Stand up two keypers — keyper 1 is the receiver under test, keyper
+        # 2 is a real dealer whose signing key we use to forge well-formed
+        # signed payloads. Keyper 3 is referenced only for the "unknown
+        # dealer" path; we build its address from its deterministic dev key.
+        from keyper import _share_payload_hash, _sign  # private helpers
+        from eth_account import Account
+        cls._share_payload_hash = staticmethod(_share_payload_hash)
+        cls._sign = staticmethod(_sign)
+
+        ports = _next_ports(2)
+        cls.keyper_port_1 = ports[1][0]
+        cls.keyper_port_2 = ports[1][1]
+        cls.app1 = create_keyper_app(1)
+        cls.app2 = create_keyper_app(2)
+        start_flask_in_thread(cls.app1, cls.keyper_port_1)
+        start_flask_in_thread(cls.app2, cls.keyper_port_2)
+        cls.url_1 = f"http://127.0.0.1:{cls.keyper_port_1}"
+        cls.url_2 = f"http://127.0.0.1:{cls.keyper_port_2}"
+        assert wait_for_server(f"{cls.url_1}/status"), "Keyper 1 not ready"
+        assert wait_for_server(f"{cls.url_2}/status"), "Keyper 2 not ready"
+
+        cls.addr_1 = requests.get(f"{cls.url_1}/status", timeout=5).json()["address"]
+        cls.addr_2 = requests.get(f"{cls.url_2}/status", timeout=5).json()["address"]
+
+        # Recover keyper 2's dev signing key (matches the keyper.py fallback
+        # so we can forge correctly-signed messages from dealer 2).
+        import hashlib
+        cls.signing_key_2 = "0x" + hashlib.sha256(b"keyper-2").hexdigest()
+        assert Account.from_key(cls.signing_key_2).address == cls.addr_2
+
+        # Pin keyper 1's DKG context so signature verification has a
+        # members[] list to compare against.
+        cls.election_id = "test-overwrite-protection"
+        members = [cls.addr_1, cls.addr_2]
+        resp = requests.post(f"{cls.url_1}/dkg/round1", json={
+            "n": 2, "t": 0, "keyper_id": 1,
+            "election_id": cls.election_id,
+            "members": members,
+        }, timeout=5)
+        assert resp.status_code == 200, resp.text
+
+    def setUp(self):
+        # Reset keyper 1's DKG state before every test by re-running round1.
+        members = [self.addr_1, self.addr_2]
+        requests.post(f"{self.url_1}/dkg/round1", json={
+            "n": 2, "t": 0, "keyper_id": 1,
+            "election_id": self.election_id, "members": members,
+        }, timeout=5)
+
+    def _signed_share_body(self, dealer_id, recipient_id, share, *, signing_key=None):
+        sk = signing_key or self.signing_key_2
+        payload_hash = self._share_payload_hash(self.election_id, dealer_id, recipient_id, share)
+        sig = self._sign(sk, payload_hash)
+        return {
+            "election_id": self.election_id,
+            "dealer_id": dealer_id,
+            "recipient_id": recipient_id,
+            "share": str(share),
+            "signature": sig,
+        }
 
     def test_first_share_accepted(self):
-        """First share from a dealer should be accepted."""
-        resp = requests.post(f"{self.keyper_url}/dkg/receive_share", json={
-            "dealer_id": 99,
-            "share": str(random_scalar()),
-        }, timeout=5)
-        self.assertEqual(resp.status_code, 200)
+        body = self._signed_share_body(2, 1, random_scalar())
+        resp = requests.post(f"{self.url_1}/dkg/receive_share", json=body, timeout=5)
+        self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(resp.json()["status"], "ok")
 
     def test_duplicate_share_rejected_with_409(self):
-        """Second share from the same dealer must be rejected with 409."""
-        share1 = str(random_scalar())
-        share2 = str(random_scalar())
+        body1 = self._signed_share_body(2, 1, random_scalar())
+        resp1 = requests.post(f"{self.url_1}/dkg/receive_share", json=body1, timeout=5)
+        self.assertEqual(resp1.status_code, 200, resp1.text)
 
-        # First share — accepted
-        resp1 = requests.post(f"{self.keyper_url}/dkg/receive_share", json={
-            "dealer_id": 100,
-            "share": share1,
-        }, timeout=5)
-        self.assertEqual(resp1.status_code, 200)
-
-        # Second share from same dealer — must be 409
-        resp2 = requests.post(f"{self.keyper_url}/dkg/receive_share", json={
-            "dealer_id": 100,
-            "share": share2,
-        }, timeout=5)
-        self.assertEqual(resp2.status_code, 409)
+        body2 = self._signed_share_body(2, 1, random_scalar())
+        resp2 = requests.post(f"{self.url_1}/dkg/receive_share", json=body2, timeout=5)
+        self.assertEqual(resp2.status_code, 409, resp2.text)
         self.assertIn("already received", resp2.json()["error"].lower())
 
-    def test_different_dealers_accepted(self):
-        """Shares from different dealers should both be accepted."""
-        resp1 = requests.post(f"{self.keyper_url}/dkg/receive_share", json={
-            "dealer_id": 201,
+    def test_unsigned_share_is_rejected(self):
+        """Phase-1 P2P requires signed messages; raw posts get 400/401."""
+        resp = requests.post(f"{self.url_1}/dkg/receive_share", json={
+            "election_id": self.election_id,
+            "dealer_id": 2, "recipient_id": 1,
             "share": str(random_scalar()),
+            # Missing signature.
         }, timeout=5)
-        self.assertEqual(resp1.status_code, 200)
+        self.assertIn(resp.status_code, (400, 401))
 
-        resp2 = requests.post(f"{self.keyper_url}/dkg/receive_share", json={
-            "dealer_id": 202,
-            "share": str(random_scalar()),
+    def test_forged_signature_is_rejected(self):
+        """A signed payload from someone other than the claimed dealer fails verify."""
+        # Sign with a key that is NOT keyper 2's. The wrong-signer recovers
+        # to a different address, so the receiver rejects it.
+        wrong_key = "0x" + ("11" * 32)
+        body = self._signed_share_body(2, 1, random_scalar(), signing_key=wrong_key)
+        resp = requests.post(f"{self.url_1}/dkg/receive_share", json=body, timeout=5)
+        self.assertEqual(resp.status_code, 401, resp.text)
+        self.assertIn("bad signature", resp.json()["error"].lower())
+
+    def test_different_dealers_accepted(self):
+        # Reset receiver and add a 3rd member so we have a 2nd valid dealer.
+        from keyper import create_keyper_app as _mk_keyper
+        # Use a separate keyper-3 process so we have a real signing key.
+        p3 = _next_ports(1)[1][0]
+        app3 = _mk_keyper(3)
+        start_flask_in_thread(app3, p3)
+        url_3 = f"http://127.0.0.1:{p3}"
+        assert wait_for_server(f"{url_3}/status")
+        addr_3 = requests.get(f"{url_3}/status", timeout=5).json()["address"]
+        import hashlib
+        signing_key_3 = "0x" + hashlib.sha256(b"keyper-3").hexdigest()
+
+        members = [self.addr_1, self.addr_2, addr_3]
+        requests.post(f"{self.url_1}/dkg/round1", json={
+            "n": 3, "t": 1, "keyper_id": 1,
+            "election_id": self.election_id, "members": members,
         }, timeout=5)
-        self.assertEqual(resp2.status_code, 200)
+
+        body_2 = self._signed_share_body(2, 1, random_scalar())
+        resp_2 = requests.post(f"{self.url_1}/dkg/receive_share", json=body_2, timeout=5)
+        self.assertEqual(resp_2.status_code, 200, resp_2.text)
+
+        body_3 = self._signed_share_body(3, 1, random_scalar(), signing_key=signing_key_3)
+        resp_3 = requests.post(f"{self.url_1}/dkg/receive_share", json=body_3, timeout=5)
+        self.assertEqual(resp_3.status_code, 200, resp_3.text)
 
 
 # =========================================================================
@@ -185,14 +261,9 @@ class TestComplaintResolution(unittest.TestCase):
         """Set up a 5-keyper cluster where we can inject bad shares to trigger complaints."""
         cls.n = 5
         cls.t = 2  # need t+1 = 3 for decryption
-        backend_port, keyper_ports, bb_port = _next_ports(cls.n)
+        backend_port, keyper_ports = _next_ports(cls.n)
 
         # Start BB
-        cls.bb_app = create_bb_app()
-        start_flask_in_thread(cls.bb_app, bb_port)
-        cls.bb_url = f"http://127.0.0.1:{bb_port}"
-        assert wait_for_server(f"{cls.bb_url}/bb/status"), "BB not ready"
-
         # Start keypers
         cls.keyper_urls = []
         cls.keyper_apps = []
@@ -203,7 +274,7 @@ class TestComplaintResolution(unittest.TestCase):
             cls.keyper_apps.append(app)
 
         # Start backend
-        cls.backend_app = create_backend_app(cls.keyper_urls, cls.bb_url)
+        cls.backend_app = create_backend_app(cls.keyper_urls)
         start_flask_in_thread(cls.backend_app, backend_port)
         cls.backend_url = f"http://127.0.0.1:{backend_port}"
 
@@ -243,10 +314,14 @@ class TestComplaintResolution(unittest.TestCase):
         params = requests.get(f"{self.backend_url}/election/params", timeout=5).json()
         election_id = params["election_id"]
 
+        # Collect keyper signing addresses for the new members[] field.
+        members = []
+        for url in self.keyper_urls:
+            members.append(requests.get(f"{url}/status", timeout=5).json()["address"])
         resp = requests.post(f"{self.keyper_urls[0]}/dkg/round1", json={
             "n": self.n, "t": self.t, "keyper_id": 1,
-            "bb_url": self.bb_url,
             "election_id": election_id,
+            "members": members,
         }, timeout=10)
         self.assertEqual(resp.status_code, 200)
 
@@ -282,14 +357,9 @@ class TestVotePhaseRecheck(unittest.TestCase):
     def setUpClass(cls):
         cls.n = 3
         cls.t = 1
-        backend_port, keyper_ports, bb_port = _next_ports(cls.n)
+        backend_port, keyper_ports = _next_ports(cls.n)
 
         # Start BB
-        cls.bb_app = create_bb_app()
-        start_flask_in_thread(cls.bb_app, bb_port)
-        cls.bb_url = f"http://127.0.0.1:{bb_port}"
-        assert wait_for_server(f"{cls.bb_url}/bb/status"), "BB not ready"
-
         # Start keypers
         cls.keyper_urls = []
         for i in range(cls.n):
@@ -298,7 +368,7 @@ class TestVotePhaseRecheck(unittest.TestCase):
             cls.keyper_urls.append(f"http://127.0.0.1:{keyper_ports[i]}")
 
         # Start backend
-        cls.backend_app = create_backend_app(cls.keyper_urls, cls.bb_url)
+        cls.backend_app = create_backend_app(cls.keyper_urls)
         start_flask_in_thread(cls.backend_app, backend_port)
         cls.backend_url = f"http://127.0.0.1:{backend_port}"
 
@@ -406,12 +476,7 @@ class TestComplaintResolutionIntegration(unittest.TestCase):
         """
         n = 5
         t = 1
-        backend_port, keyper_ports, bb_port = _next_ports(n)
-
-        bb_app = create_bb_app()
-        start_flask_in_thread(bb_app, bb_port)
-        bb_url = f"http://127.0.0.1:{bb_port}"
-        assert wait_for_server(f"{bb_url}/bb/status")
+        backend_port, keyper_ports = _next_ports(n)
 
         keyper_urls = []
         keyper_apps = []
@@ -421,7 +486,7 @@ class TestComplaintResolutionIntegration(unittest.TestCase):
             keyper_urls.append(f"http://127.0.0.1:{keyper_ports[i]}")
             keyper_apps.append(app)
 
-        backend_app = create_backend_app(keyper_urls, bb_url)
+        backend_app = create_backend_app(keyper_urls)
         start_flask_in_thread(backend_app, backend_port)
         backend_url = f"http://127.0.0.1:{backend_port}"
 
@@ -440,18 +505,32 @@ class TestComplaintResolutionIntegration(unittest.TestCase):
         params = requests.get(f"{backend_url}/election/params", timeout=5).json()
         election_id = params["election_id"]
 
+        # Collect keyper addresses for the members[] field.
+        members = []
+        for url in keyper_urls:
+            members.append(requests.get(f"{url}/status", timeout=5).json()["address"])
+
         # --- Manually run round1 for all keypers ---
+        round1_responses = []
         for i in range(n):
             kid = i + 1
             resp = requests.post(f"{keyper_urls[i]}/dkg/round1", json={
                 "n": n, "t": t, "keyper_id": kid,
-                "bb_url": bb_url,
                 "election_id": election_id,
+                "members": members,
             }, timeout=10)
             self.assertEqual(resp.status_code, 200, f"Round1 failed for keyper {kid}: {resp.text}")
+            round1_responses.append(resp.json())
 
-        # --- Distribute shares P2P ---
+        # --- Fan out commitments P2P (signed) ---
         keyper_url_map = {str(i + 1): keyper_urls[i] for i in range(n)}
+        for i in range(n):
+            resp = requests.post(f"{keyper_urls[i]}/dkg/distribute_commitments", json={
+                "keyper_urls": keyper_url_map,
+            }, timeout=30)
+            self.assertEqual(resp.status_code, 200, f"Commitment distribution failed for keyper {i+1}")
+
+        # --- Distribute shares P2P (signed) ---
         for i in range(n):
             resp = requests.post(f"{keyper_urls[i]}/dkg/distribute_shares", json={
                 "keyper_urls": keyper_url_map,
@@ -466,12 +545,8 @@ class TestComplaintResolutionIntegration(unittest.TestCase):
         revealed_data = resp.json()
         revealed_share = int(revealed_data["share"])
 
-        # Read commitments from BB to verify independently
-        from bulletin_board import BBClient
-        bb = BBClient(bb_url)
-        topic = f"dkg/{election_id}/commitments"
-        raw_entries = bb.read_topic(topic)
-        dealer_1_comms = [dict_to_point(c) for c in raw_entries["1"]]
+        # Pull dealer 1's commitments from its round1 response.
+        dealer_1_comms = [dict_to_point(c) for c in round1_responses[0]["commitments"]]
 
         # Verify: revealed_share · G2 == Σⱼ (3^j mod q) · γⱼ
         expected_pt = Z2
@@ -487,7 +562,6 @@ class TestComplaintResolutionIntegration(unittest.TestCase):
         # --- Now complete the DKG via the backend to ensure it still works ---
         # Reset and re-run through the backend for the full flow
         requests.post(f"{backend_url}/election/reset", json={}, timeout=10)
-        # Need fresh BB too - use a different election_id
         resp = requests.post(f"{backend_url}/election/create", json={
             "n": n, "t": t, "num_candidates": 2, "budget": 1,
             "candidate_names": ["Yes", "No"],
