@@ -766,6 +766,20 @@ def build_ballot(
         if v < 0 or v > budget:
             raise ValueError(f"vote[{j}] = {v} not in [0, {budget}]")
 
+    # Aggregate-vote bound. This port is exact-mode only; without this check a
+    # vote vector violating Σvotes == B would encrypt fine and the budget proof
+    # would fail at the verifier — caller never learns the input was wrong.
+    vote_sum = sum(int(v) for v in votes)
+    if vote_sum != budget:
+        raise ValueError(
+            f"build_ballot: exact mode requires Σvotes == {budget}, got {vote_sum}"
+        )
+
+    # Keypair sanity: vk must equal sk · P1. Catches mismatched-keypair bugs at
+    # construction instead of producing a ballot whose Schnorr signature fails.
+    if _g1_mul(sk) != vk:
+        raise ValueError("build_ballot: vk does not match sk · P1 (mismatched keypair)")
+
     # 1. Encrypt.
     ciphertexts_pts: list[tuple] = []
     rs_used: list[int] = []
@@ -884,6 +898,9 @@ def verify_ballot(
         return False, f"electionId must be 32 bytes"
     if len(pseudonym) != 32:
         return False, f"pseudonym must be 32 bytes"
+
+    if mpk == Z2:
+        return False, "mpk is identity (would collapse ciphertext privacy)"
 
     try:
         vk = g1_from_compressed(vk_bytes)
