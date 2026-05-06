@@ -37,12 +37,10 @@ CLI usage:
 
     python tally_aggregator.py aggregate --election 0x... --rpc-url ...
     python tally_aggregator.py finalize  --election 0x... --rpc-url ...
-    python tally_aggregator.py auto      --election 0x... --rpc-url ...
+    python tally_aggregator.py daemon    --election 0x... --rpc-url ...
 
 The signer's private key is read from ``--private-key`` or, preferably,
 the ``TALLY_AGGREGATOR_PRIVATE_KEY`` environment variable.
-
-Daemon mode (poll-and-act) is **not** implemented yet — see ``TODO.md``.
 """
 
 from __future__ import annotations
@@ -315,6 +313,104 @@ def finalize(
         keyper_indices=used_keyper_indices,
     )
 
+def _now_ts(chain: EthChain) -> int:
+    return int(chain.w3.eth.get_block("latest")["timestamp"])
+
+
+def _aggregate_published(election: ElectionClient) -> bool:
+    try:
+        election.get_aggregate()
+        return True
+    except Exception:
+        return False
+
+
+def daemon(
+    chain: EthChain,
+    election_address: str,
+    signer: LocalAccount,
+    *,
+    poll: float = 10.0,
+    quiet: bool = False,
+) -> int:
+    """Long-running poll-and-act loop.
+
+    - Wait until voting has ended (on-chain), then publishAggregate if missing.
+    - Wait until thresholdT decryption shares are present, then publishResult.
+    - Exit after result is finalized.
+
+    This is intentionally idempotent: it re-checks on-chain state before
+    attempting writes and tolerates being restarted mid-election.
+    """
+    election = ElectionClient(chain, election_address)
+
+    while True:
+        try:
+            if election.is_result_finalized():
+                if not quiet:
+                    print("[daemon] result already finalized")
+                return 0
+
+            if not election.is_dkg_finalized():
+                if not quiet:
+                    print("[daemon] waiting: DKG not finalized yet")
+                time.sleep(poll)
+                continue
+
+            phase = int(election.get_phase())
+            # Election.getPhase(): >=4 implies votingEnd has passed.
+            if phase < 4:
+                if not quiet:
+                    info = election.get_election()
+                    ve = int(info["config"]["votingEnd"])
+                    now = _now_ts(chain)
+                    left = ve - now
+                    print(f"[daemon] waiting: voting still open (phase={phase}, votingEnd-now={left}s)")
+                time.sleep(poll)
+                continue
+
+            if not _aggregate_published(election):
+                if not quiet:
+                    print("[daemon] publishing aggregate…")
+                agg = aggregate(chain, election_address, signer)
+                if not quiet:
+                    print(json.dumps(agg.as_dict(), indent=2, default=str))
+                time.sleep(poll)
+                continue
+
+            info = election.get_election()
+            threshold = int(info["config"]["thresholdT"])
+            shares = election.get_decryption_shares()
+            if len(shares) < threshold:
+                if not quiet:
+                    print(f"[daemon] waiting: shares on chain {len(shares)}/{threshold}")
+                time.sleep(poll)
+                continue
+
+            if not quiet:
+                print("[daemon] finalizing result…")
+            fin = finalize(chain, election_address, signer)
+            if not quiet:
+                print(json.dumps(fin.as_dict(), indent=2, default=str))
+            return 0
+
+        except TallyAggregatorError as e:
+            # Expected transient failures (e.g. not enough shares, pkWR unset)
+            # should not crash the daemon. Surface the error and keep polling.
+            if not quiet:
+                print(f"[daemon] error: {e}", file=sys.stderr)
+                if e.data:
+                    print(json.dumps(e.data, indent=2), file=sys.stderr)
+            time.sleep(poll)
+        except KeyboardInterrupt:
+            print("\n[daemon] interrupted", file=sys.stderr)
+            return 130
+        except Exception as e:
+            # Unknown error: surface and keep trying. Operators can kill if needed.
+            if not quiet:
+                print(f"[daemon] unexpected error: {e}", file=sys.stderr)
+            time.sleep(poll)
+
 
 # ---------------------------------------------------------------------------
 #  CLI
@@ -374,42 +470,17 @@ def _cmd_finalize(args) -> int:
     return 0
 
 
-def _cmd_auto(args) -> int:
-    """``aggregate`` then poll for threshold-many shares, then ``finalize``."""
+def _cmd_daemon(args) -> int:
     signer = _resolve_signer(args)
     chain = EthChain.connect(args.rpc_url, private_key=args.private_key
                              or os.environ.get(PRIVATE_KEY_ENV))
-
-    try:
-        agg = aggregate(chain, args.election, signer)
-    except TallyAggregatorError as e:
-        print(f"aggregate failed: {e}", file=sys.stderr)
-        return 1
-    print("--- aggregate ---")
-    _print_result(agg)
-
-    election = ElectionClient(chain, args.election)
-    threshold = election.get_election()["config"]["thresholdT"]
-    deadline = time.monotonic() + args.timeout
-    while time.monotonic() < deadline:
-        shares = election.get_decryption_shares()
-        print(f"  shares on chain: {len(shares)}/{threshold} "
-              f"(polling every {args.poll}s, {int(deadline - time.monotonic())}s left)")
-        if len(shares) >= threshold:
-            break
-        time.sleep(args.poll)
-    else:
-        print(f"timed out waiting for {threshold} shares", file=sys.stderr)
-        return 2
-
-    try:
-        fin = finalize(chain, args.election, signer)
-    except TallyAggregatorError as e:
-        print(f"finalize failed: {e}", file=sys.stderr)
-        return 1
-    print("--- finalize ---")
-    _print_result(fin)
-    return 0
+    return daemon(
+        chain,
+        args.election,
+        signer,
+        poll=args.poll,
+        quiet=args.quiet,
+    )
 
 
 def main():
@@ -426,13 +497,13 @@ def main():
     _add_common_args(p_fin)
     p_fin.set_defaults(func=_cmd_finalize)
 
-    p_auto = sub.add_parser("auto", help="aggregate → poll for shares → finalize")
-    _add_common_args(p_auto)
-    p_auto.add_argument("--poll", type=float, default=2.0,
-                        help="Seconds between share-count polls (default 2)")
-    p_auto.add_argument("--timeout", type=float, default=300.0,
-                        help="Seconds to wait for threshold-many shares (default 300)")
-    p_auto.set_defaults(func=_cmd_auto)
+    p_daemon = sub.add_parser("daemon", help="Watch chain and finalize automatically")
+    _add_common_args(p_daemon)
+    p_daemon.add_argument("--poll", type=float, default=10.0,
+                          help="Seconds between polls (default 10)")
+    p_daemon.add_argument("--quiet", action="store_true",
+                          help="Reduce log output (errors still printed)")
+    p_daemon.set_defaults(func=_cmd_daemon)
 
     args = parser.parse_args()
     sys.exit(args.func(args))
