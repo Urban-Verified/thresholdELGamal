@@ -55,6 +55,7 @@ from wr_oracle import create_wr_oracle_app  # noqa: E402
 from sdk_compat import schnorr_keygen  # noqa: E402
 from crypto.primitives import g1_to_compressed  # noqa: E402
 import tally_aggregator  # noqa: E402
+from tally_aggregator import TallyAggregatorError  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -63,8 +64,7 @@ import tally_aggregator  # noqa: E402
 
 def _free_port() -> int:
     """Ask the OS for an unused TCP port. Avoids hard-coded port collisions
-    between tests (each test needs ~6 ports for BB + keypers + proxy +
-    backend).
+    between tests (each test needs ~6 ports for WR + keypers + proxy).
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -248,15 +248,18 @@ class _OnChainDeployment:
 
 
 def _bring_up_election(sc: _SessionChain, *, num_candidates: int, budget: int,
-                       voting_window_secs: int = 30) -> _OnChainDeployment:
+                       voting_window_secs: int = 30,
+                       self_submit_fee: int = 0,
+                       voting_start_offset_secs: int = -60) -> _OnChainDeployment:
     # Use chain time, not wall-clock — earlier tests in the session may have
     # fast-forwarded the chain past now() to enable publishAggregate.
     now = int(sc.chain.w3.eth.get_block("latest")["timestamp"])
+    voting_start = now + voting_start_offset_secs
     voting_end = now + voting_window_secs
     election_address = publish_election(
         chain=sc.chain, registry_address=sc.registry, keyper_set_address=sc.keyper_set,
-        voting_start=now - 60, voting_end=voting_end,
-        num_candidates=num_candidates, budget=budget, self_submit_fee=0,
+        voting_start=voting_start, voting_end=voting_end,
+        num_candidates=num_candidates, budget=budget, self_submit_fee=self_submit_fee,
         pk_wr=sc.wr_pk,
         tally_aggregator=sc.tally, vote_proxy=sc.proxy_addr,
     )
@@ -280,9 +283,7 @@ def _bring_up_election(sc: _SessionChain, *, num_candidates: int, budget: int,
         proxy_port,
     )
 
-    # Wait for everything to be reachable. The on-chain test path doesn't
-    # need a Flask backend — DKG runs P2P among keypers, tally aggregation
-    # is a library call.
+    # Wait for everything to be reachable.
     for url in keyper_urls:
         _wait_http(f"{url}/status")
     _wait_http(f"{proxy_url}/status")
@@ -331,6 +332,16 @@ def test_full_onchain_lifecycle_single_choice(session_chain: _SessionChain) -> N
 
     dep.request_decryption_shares()
     assert len(dep.election.get_decryption_shares()) == 3
+
+    # Idempotency: each keyper should skip on second submission.
+    for url in dep.keyper_urls:
+        r = requests.post(
+            f"{url}/decrypt/publish_on_chain",
+            json={"election_address": dep.election_address},
+            timeout=30,
+        ).json()
+        assert r.get("skipped") == "already_submitted", r
+        assert r.get("tx_hash") is None, r
 
     fin = dep.finalize()
     assert fin.totals == expected
@@ -467,7 +478,7 @@ def test_dleq_proofs_match_sdk_transcript(session_chain: _SessionChain) -> None:
             ), f"DLEQ verify failed: keyper {k_dkg}, candidate {j}"
 
 
-def test_backend_rejects_ballot_with_tampered_wr_attestation(
+def test_aggregate_rejects_ballot_with_tampered_wr_attestation(
     session_chain: _SessionChain,
 ) -> None:
     """A ballot whose WR attestation is mutated post-issuance must:
@@ -545,3 +556,277 @@ def test_backend_rejects_ballot_with_tampered_wr_attestation(
     dep.request_decryption_shares()
     fin = dep.finalize()
     assert fin.totals == expected, (fin.totals, expected)
+
+
+def test_vote_rejected_after_voting_end(session_chain: _SessionChain) -> None:
+    """The contract must reject ballots after ``votingEnd`` (even via the proxy)."""
+    dep = _bring_up_election(session_chain, num_candidates=3, budget=1, voting_window_secs=8)
+    dep.run_dkg()
+
+    dep.fast_forward_to_voting_end()
+    ok = cast_vote_via_proxy(
+        dep.proxy_url, session_chain.rpc_url, dep.election_address, [1, 0, 0],
+        wr_url=session_chain.wr_url,
+    )
+    assert ok is False
+
+
+def test_self_submit_fee_enforced_for_non_proxy_submitter(session_chain: _SessionChain) -> None:
+    """A non-proxy submitter must pay ``selfSubmitFee``; the proxy can submit with value=0."""
+    from voter import _fetch_wr_attestation
+    from sdk_compat import build_ballot, election_id_to_bytes32, schnorr_keygen
+    from crypto.primitives import g1_to_compressed, g2_from_compressed
+
+    fee = 123
+    dep = _bring_up_election(session_chain, num_candidates=3, budget=1, self_submit_fee=fee)
+    dep.run_dkg()
+
+    info = dep.election.get_election()
+    mpk = g2_from_compressed(info["dkg"]["pkElection"])
+    eid_bytes = election_id_to_bytes32(info["config"]["electionId"])
+
+    pseudonym = os.urandom(32)
+    sk, vk = schnorr_keygen()
+    vk_bytes = g1_to_compressed(vk)
+    wr_attestation = _fetch_wr_attestation(session_chain.wr_url, eid_bytes, pseudonym, vk_bytes)
+    built = build_ballot(
+        mpk=mpk,
+        election_id=eid_bytes,
+        pseudonym=pseudonym,
+        sk=sk,
+        vk=vk,
+        votes=[1, 0, 0],
+        num_candidates=3,
+        budget=1,
+    )
+    ballot = {
+        "pseudonym": built.pseudonym,
+        "vk": built.vk,
+        "ciphertexts": built.ciphertexts,
+        "zkProof": built.zk_proof,
+        "voterSignature": built.voter_signature,
+        "wrAttestation": wr_attestation,
+    }
+
+    # Admin is not the vote proxy; value=0 must revert.
+    admin = Account.from_key(session_chain.admin_key)
+    with pytest.raises(Exception):
+        dep.election.submit_vote(ballot, signer=admin, value=0)
+
+    # Paying the fee should succeed.
+    dep.election.submit_vote(ballot, signer=admin, value=fee)
+    assert dep.election.get_num_ballots() == 1
+
+
+def test_publish_aggregate_requires_tally_aggregator_role(session_chain: _SessionChain) -> None:
+    """Only the configured tally aggregator address can call publishAggregate."""
+    dep = _bring_up_election(session_chain, num_candidates=3, budget=1, voting_window_secs=12)
+    dep.run_dkg()
+
+    assert cast_vote_via_proxy(
+        dep.proxy_url, session_chain.rpc_url, dep.election_address, [1, 0, 0],
+        wr_url=session_chain.wr_url,
+    )
+    dep.fast_forward_to_voting_end()
+
+    # Wrong signer (admin) should revert publishAggregate.
+    admin = Account.from_key(session_chain.admin_key)
+    with pytest.raises(TallyAggregatorError, match="publishAggregate reverted"):
+        tally_aggregator.aggregate(session_chain.chain, dep.election_address, admin)
+
+
+def test_publish_aggregate_rejected_before_voting_end(session_chain: _SessionChain) -> None:
+    """Even a valid aggregate may not be published while voting is still open."""
+    dep = _bring_up_election(session_chain, num_candidates=3, budget=1, voting_window_secs=20)
+    dep.run_dkg()
+    assert cast_vote_via_proxy(
+        dep.proxy_url, session_chain.rpc_url, dep.election_address, [1, 0, 0],
+        wr_url=session_chain.wr_url,
+    )
+
+    # Voting is still open; contract should revert VotingStillOpen, which the
+    # tally aggregator surfaces as a publishAggregate revert.
+    with pytest.raises(TallyAggregatorError, match="publishAggregate reverted"):
+        dep.aggregate()
+
+
+def test_finalize_rejected_with_insufficient_decryption_shares(session_chain: _SessionChain) -> None:
+    """Finalize must fail until threshold-many decryption shares exist on chain."""
+    dep = _bring_up_election(session_chain, num_candidates=3, budget=1, voting_window_secs=10)
+    dep.run_dkg()
+    for v in ([1, 0, 0], [0, 1, 0]):
+        assert cast_vote_via_proxy(
+            dep.proxy_url, session_chain.rpc_url, dep.election_address, v,
+            wr_url=session_chain.wr_url,
+        )
+    dep.fast_forward_to_voting_end()
+    dep.aggregate()
+
+    # Threshold is 2-of-3 but only one keyper submits shares.
+    r = requests.post(
+        f"{dep.keyper_urls[0]}/decrypt/publish_on_chain",
+        json={"election_address": dep.election_address},
+        timeout=30,
+    ).json()
+    assert "error" not in r, r
+
+    with pytest.raises(TallyAggregatorError, match="need 2"):
+        dep.finalize()
+
+
+def test_publish_result_requires_tally_aggregator_role(session_chain: _SessionChain) -> None:
+    """Only the configured tally aggregator address can call publishResult."""
+    dep = _bring_up_election(session_chain, num_candidates=3, budget=1, voting_window_secs=12)
+    dep.run_dkg()
+    for v in ([1, 0, 0], [0, 1, 0], [1, 0, 0]):
+        assert cast_vote_via_proxy(
+            dep.proxy_url, session_chain.rpc_url, dep.election_address, v,
+            wr_url=session_chain.wr_url,
+        )
+    dep.fast_forward_to_voting_end()
+    dep.aggregate()
+    dep.request_decryption_shares()
+
+    admin = Account.from_key(session_chain.admin_key)
+    with pytest.raises(TallyAggregatorError, match="publishResult reverted"):
+        tally_aggregator.finalize(session_chain.chain, dep.election_address, admin)
+
+
+def test_submit_vote_rejects_wrong_ciphertext_count(session_chain: _SessionChain) -> None:
+    """Contract must reject ballots where ciphertext array length != numCandidates."""
+    from voter import _fetch_wr_attestation
+    from sdk_compat import build_ballot, election_id_to_bytes32, schnorr_keygen
+    from crypto.primitives import g1_to_compressed, g2_from_compressed
+
+    dep = _bring_up_election(session_chain, num_candidates=3, budget=1, voting_window_secs=12)
+    dep.run_dkg()
+
+    info = dep.election.get_election()
+    mpk = g2_from_compressed(info["dkg"]["pkElection"])
+    eid_bytes = election_id_to_bytes32(info["config"]["electionId"])
+
+    pseudonym = os.urandom(32)
+    sk, vk = schnorr_keygen()
+    vk_bytes = g1_to_compressed(vk)
+    wr_attestation = _fetch_wr_attestation(session_chain.wr_url, eid_bytes, pseudonym, vk_bytes)
+    built = build_ballot(
+        mpk=mpk,
+        election_id=eid_bytes,
+        pseudonym=pseudonym,
+        sk=sk,
+        vk=vk,
+        votes=[1, 0, 0],
+        num_candidates=3,
+        budget=1,
+    )
+
+    # Truncate ciphertexts so payload fails the contract's ciphertext-count check.
+    bad_ballot = {
+        "pseudonym": built.pseudonym,
+        "vk": built.vk,
+        "ciphertexts": built.ciphertexts[:2],
+        "zkProof": built.zk_proof,
+        "voterSignature": built.voter_signature,
+        "wrAttestation": wr_attestation,
+    }
+
+    proxy_signer = Account.from_key(session_chain.proxy_key)
+    with pytest.raises(Exception):
+        dep.election.submit_vote(bad_ballot, signer=proxy_signer, value=0)
+
+
+def test_vote_rejected_before_voting_start(session_chain: _SessionChain) -> None:
+    """Contract must reject ballots before votingStart (VotingNotStarted)."""
+    dep = _bring_up_election(
+        session_chain,
+        num_candidates=3,
+        budget=1,
+        voting_window_secs=90,
+        voting_start_offset_secs=60,  # start in the future
+    )
+    dep.run_dkg()
+
+    ok = cast_vote_via_proxy(
+        dep.proxy_url, session_chain.rpc_url, dep.election_address, [1, 0, 0],
+        wr_url=session_chain.wr_url,
+    )
+    assert ok is False
+
+
+def test_finalize_rejected_before_aggregate_published(session_chain: _SessionChain) -> None:
+    """Even with shares present, finalize must fail until an aggregate is published."""
+    dep = _bring_up_election(session_chain, num_candidates=3, budget=1, voting_window_secs=12)
+    dep.run_dkg()
+
+    # No ballots and no aggregate published.
+    dep.fast_forward_to_voting_end()
+
+    with pytest.raises(TallyAggregatorError, match="Aggregate not yet published"):
+        dep.finalize()
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        ("vk_wrong_len",),
+        ("empty_zkProof",),
+        ("empty_voterSignature",),
+        ("empty_wrAttestation",),
+        ("ciphertext_wrong_g2_len",),
+    ],
+)
+def test_submit_vote_rejects_invalid_payload_fields(session_chain: _SessionChain, mutator: tuple[str]) -> None:
+    """Contract-level payload checks: these should revert with InvalidVotePayload / InvalidG2PointLength."""
+    from voter import _fetch_wr_attestation
+    from sdk_compat import build_ballot, election_id_to_bytes32, schnorr_keygen
+    from crypto.primitives import g1_to_compressed, g2_from_compressed
+
+    dep = _bring_up_election(session_chain, num_candidates=2, budget=1, voting_window_secs=30)
+    dep.run_dkg()
+
+    info = dep.election.get_election()
+    mpk = g2_from_compressed(info["dkg"]["pkElection"])
+    eid_bytes = election_id_to_bytes32(info["config"]["electionId"])
+
+    pseudonym = os.urandom(32)
+    sk, vk = schnorr_keygen()
+    vk_bytes = g1_to_compressed(vk)
+    wr_attestation = _fetch_wr_attestation(session_chain.wr_url, eid_bytes, pseudonym, vk_bytes)
+    built = build_ballot(
+        mpk=mpk,
+        election_id=eid_bytes,
+        pseudonym=pseudonym,
+        sk=sk,
+        vk=vk,
+        votes=[1, 0],
+        num_candidates=2,
+        budget=1,
+    )
+
+    ballot = {
+        "pseudonym": built.pseudonym,
+        "vk": built.vk,
+        "ciphertexts": built.ciphertexts,
+        "zkProof": built.zk_proof,
+        "voterSignature": built.voter_signature,
+        "wrAttestation": wr_attestation,
+    }
+
+    which = mutator[0]
+    if which == "vk_wrong_len":
+        ballot["vk"] = ballot["vk"][:-1]
+    elif which == "empty_zkProof":
+        ballot["zkProof"] = b""
+    elif which == "empty_voterSignature":
+        ballot["voterSignature"] = b""
+    elif which == "empty_wrAttestation":
+        ballot["wrAttestation"] = b""
+    elif which == "ciphertext_wrong_g2_len":
+        c1, c2 = ballot["ciphertexts"][0]
+        ballot["ciphertexts"][0] = (c1[:-1], c2)
+    else:
+        raise AssertionError(which)
+
+    proxy_signer = Account.from_key(session_chain.proxy_key)
+    with pytest.raises(Exception):
+        dep.election.submit_vote(ballot, signer=proxy_signer, value=0)

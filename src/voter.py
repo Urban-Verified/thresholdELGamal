@@ -2,17 +2,11 @@
 """
 Voter CLI — Encrypts votes client-side and submits them.
 
-Two paths are supported:
-
-  * **Vote proxy + chain** (production-shaped): voter reads election
+The canonical path is **Vote proxy + chain** (production-shaped): voter reads election
     parameters from the on-chain ``Election`` contract, encrypts ballots
     locally against ``mpk``, and POSTs a contract-shaped ``Ballot`` to
     the dev ``vote_proxy.py`` server. The proxy holds
     ``VOTE_PROXY_ROLE`` and forwards the call to ``submitVote``.
-
-  * **Legacy backend** (off-chain path, kept for the existing tests):
-    voter POSTs encrypted ciphertexts + range/budget proofs to the
-    backend's ``/election/vote`` endpoint.
 
 Per PLAN.md decision C, the voter currently sends fixed-size **dummy**
 bytes for ``vk``, ``voterSignature``, ``wrAttestation``, and ``zkProof``.
@@ -25,11 +19,6 @@ Usage (chain path):
                            --rpc-url http://127.0.0.1:8545 \\
                            --election 0x... --choice 2
     python voter.py result --rpc-url http://127.0.0.1:8545 --election 0x...
-
-Usage (legacy backend path):
-    python voter.py params --backend http://127.0.0.1:5000
-    python voter.py vote   --backend http://127.0.0.1:5000 --votes 0,0,1
-    python voter.py result --backend http://127.0.0.1:5000
 """
 
 import argparse
@@ -40,19 +29,10 @@ import requests
 
 from crypto.elgamal import aggregate_ciphertexts, encrypt
 from crypto.primitives import (
-    CURVE_ORDER,
-    dict_to_point,
     g2_from_compressed,
-    g2_to_compressed,
-    point_to_dict,
 )
-from crypto.proofs import prove_exact_budget, prove_range
 import sdk_compat
 
-
-# ----------------------------------------------------------------------
-#  Helpers shared by both paths
-# ----------------------------------------------------------------------
 
 def _validate_vote_vector(vote_vector, num_candidates, B):
     if len(vote_vector) != num_candidates:
@@ -202,107 +182,16 @@ def show_result_chain(rpc_url, election_address):
 
 
 # ----------------------------------------------------------------------
-#  Legacy backend path (used by the off-chain test suite until step 11)
-# ----------------------------------------------------------------------
-
-def get_election_params(backend_url):
-    resp = requests.get(f"{backend_url}/election/params", timeout=10)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def cast_vote_via_backend(backend_url, vote_vector):
-    params = get_election_params(backend_url)
-    if params["phase"] != "voting":
-        print(f"Error: Election is in phase '{params['phase']}', not accepting votes.")
-        return False
-
-    mpk = dict_to_point(params["mpk"])
-    num_cand = params["num_candidates"]
-    B = params["budget"]
-    election_id = params.get("election_id", "")
-    _validate_vote_vector(vote_vector, num_cand, B)
-
-    ciphertexts, randomness = _encrypt_ballot(mpk, vote_vector)
-    range_proofs = [
-        prove_range(mpk, ct[0], ct[1], v, r, B, election_id=election_id)
-        for ct, v, r in zip(ciphertexts, vote_vector, randomness)
-    ]
-    sum_ct = aggregate_ciphertexts(ciphertexts)
-    r_sum = sum(randomness) % CURVE_ORDER
-    budget_proof = prove_exact_budget(mpk, sum_ct[0], sum_ct[1], B, r_sum, election_id=election_id)
-
-    payload = {
-        "ciphertexts": [
-            {"c1": point_to_dict(ct[0]), "c2": point_to_dict(ct[1])} for ct in ciphertexts
-        ],
-        "range_proofs": [
-            [{"e": str(e), "z": str(z)} for (e, z) in proof] for proof in range_proofs
-        ],
-        "budget_proof": {"e": str(budget_proof[0]), "z": str(budget_proof[1])},
-    }
-    resp = requests.post(f"{backend_url}/election/vote", json=payload, timeout=30)
-    result = resp.json()
-    if resp.status_code == 200 and result.get("status") == "ok":
-        print(f"Vote accepted: {result.get('message', '')}")
-        return True
-    print(f"Vote rejected: {result.get('error', 'Unknown error')}")
-    return False
-
-
-def show_params_backend(backend_url):
-    params = get_election_params(backend_url)
-    print(f"Phase:          {params['phase']}")
-    print(f"Curve:          {params.get('curve', 'BLS12-381')}")
-    print(f"Group:          {params.get('group', 'G2')}")
-    print(f"Candidates:     {params['num_candidates']}")
-    for i, name in enumerate(params.get("candidate_names", [])):
-        print(f"  [{i}] {name}")
-    print(f"Budget:         {params['budget']}")
-    print(f"Keypers:        {params['n']} (threshold t={params['t']}, need {params['t']+1} for decryption)")
-    print(f"Public key set: {'yes' if params.get('mpk') else 'no'}")
-
-
-def show_result_backend(backend_url):
-    resp = requests.get(f"{backend_url}/election/result", timeout=10)
-    if resp.status_code == 404:
-        print("No results available yet.")
-        return
-    resp.raise_for_status()
-    data = resp.json()
-    print(f"Phase:         {data['phase']}")
-    print(f"Total ballots: {data['total_ballots']}")
-    print("Results:")
-    for name, count in data["results"].items():
-        print(f"  {name}: {count}")
-
-
-def show_status_backend(backend_url):
-    resp = requests.get(f"{backend_url}/election/status", timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    print(f"Phase:           {data['phase']}")
-    print(f"Candidates:      {data['num_candidates']}")
-    print(f"Budget:          {data['budget']}")
-    print(f"Ballots:         {data['ballots_received']}")
-    print(f"Has result:      {data['has_result']}")
-
-
-# ----------------------------------------------------------------------
 #  CLI
 # ----------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Voter CLI for threshold ElGamal voting")
 
-    # Mutually exclusive at logic level: either (--proxy + --rpc-url + --election)
-    # for chain mode, or --backend for legacy mode. We allow both flags so each
-    # subcommand can decide.
     parser.add_argument("--proxy", default=None, help="Vote proxy URL (chain mode)")
     parser.add_argument("--rpc-url", default=None, help="Ethereum RPC URL (chain mode)")
     parser.add_argument("--election", default=None, help="Election address (chain mode)")
     parser.add_argument("--wr", default=None, help="WR oracle URL (chain mode)")
-    parser.add_argument("--backend", default=None, help="Off-chain backend URL (legacy mode)")
     sub = parser.add_subparsers(dest="command", help="Command to run")
 
     sub.add_parser("params", help="Show election parameters")
@@ -313,41 +202,24 @@ def main():
     vote_g.add_argument("--votes", type=str, help="Budget vote: comma-separated values per candidate")
 
     sub.add_parser("result", help="Show election result")
-    sub.add_parser("status", help="Show election status (legacy backend only)")
 
     args = parser.parse_args()
     if args.command is None:
         parser.print_help()
         return
 
-    chain_mode = bool(args.proxy or args.rpc_url or args.election)
-    backend_mode = bool(args.backend)
-    if chain_mode and backend_mode:
-        parser.error("Pass either chain flags (--proxy / --rpc-url / --election) OR --backend, not both")
-    if not chain_mode and not backend_mode:
-        # Default to legacy backend if nothing specified, for backwards compatibility.
-        args.backend = "http://127.0.0.1:5000"
-        backend_mode = True
+    if not (args.rpc_url and args.election):
+        parser.error("--rpc-url and --election are required")
 
     try:
         if args.command == "params":
-            if chain_mode:
-                if not (args.rpc_url and args.election):
-                    parser.error("Chain mode requires --rpc-url and --election")
-                show_params_chain(args.rpc_url, args.election)
-            else:
-                show_params_backend(args.backend)
+            show_params_chain(args.rpc_url, args.election)
 
         elif args.command == "vote":
-            # Resolve config to validate the vote vector before submitting.
-            if chain_mode:
-                if not (args.proxy and args.rpc_url and args.election):
-                    parser.error("Chain vote requires --proxy, --rpc-url, and --election")
-                cfg = _read_election_from_chain(args.rpc_url, args.election)
-                num_cand, B = cfg["num_candidates"], cfg["budget"]
-            else:
-                params = get_election_params(args.backend)
-                num_cand, B = params["num_candidates"], params["budget"]
+            if not args.proxy:
+                parser.error("vote requires --proxy")
+            cfg = _read_election_from_chain(args.rpc_url, args.election)
+            num_cand, B = cfg["num_candidates"], cfg["budget"]
 
             if args.choice is not None:
                 if args.choice < 0 or args.choice >= num_cand:
@@ -361,29 +233,15 @@ def main():
             else:
                 vote_vector = [int(x.strip()) for x in args.votes.split(",")]
 
-            ok = (
-                cast_vote_via_proxy(args.proxy, args.rpc_url, args.election, vote_vector,
-                                    wr_url=args.wr)
-                if chain_mode else
-                cast_vote_via_backend(args.backend, vote_vector)
+            ok = cast_vote_via_proxy(
+                args.proxy, args.rpc_url, args.election, vote_vector,
+                wr_url=args.wr,
             )
             if not ok:
                 sys.exit(1)
 
         elif args.command == "result":
-            if chain_mode:
-                if not (args.rpc_url and args.election):
-                    parser.error("Chain mode requires --rpc-url and --election")
-                show_result_chain(args.rpc_url, args.election)
-            else:
-                show_result_backend(args.backend)
-
-        elif args.command == "status":
-            if chain_mode:
-                # On-chain status equivalent.
-                show_params_chain(args.rpc_url, args.election)
-            else:
-                show_status_backend(args.backend)
+            show_result_chain(args.rpc_url, args.election)
 
     except requests.exceptions.ConnectionError as e:
         print(f"Connection error: {e}")

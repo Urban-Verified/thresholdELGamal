@@ -129,7 +129,7 @@ class KeyperDKGState:
 # ----------------------------------------------------------------------
 #  Public-key derivation from commitments
 #
-#  These are the formulae backend.py and keyper.py share when computing
+#  These are the formulae the keyper and the (deprecated) off-chain tooling shared when computing
 #  the joint master public key and per-keyper public-key shares from the
 #  bulletin-board commitments. Pulling them out as module-level functions
 #  ensures both sides agree byte-for-byte.

@@ -2,9 +2,6 @@
 """
 DKG coordinator — orchestrates the keyper HTTP APIs for Feldman VSS DKG.
 
-This replaces the legacy `/election/dkg` backend orchestration for the on-chain
-pipeline.
-
 Flow (matches RUNNING.md):
   round1 → distribute_commitments → distribute_shares → round2 → publish_on_chain
 """
