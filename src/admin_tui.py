@@ -82,6 +82,9 @@ _chain_state: dict = {
     "keyper_set_addr": None,
     "registry_addr": None,
     "elections": [],         # list of Election addresses, in publish order
+    # Human-readable candidate labels for the latest published election; reset
+    # on each new publishElection. TUI-only — not persisted on chain.
+    "candidate_names": [],
     # WR oracle — Schnorr-on-G1 keypair (BLS12-381), separate from anvil keys.
     "wr_sk": None,           # int (Schnorr secret on G1)
     "wr_pk": None,           # bytes (48-byte compressed G1, written to Election.pkWR)
@@ -512,7 +515,11 @@ def create_election_on_chain_tui():
         return
 
     num_candidates = IntPrompt.ask("  Number of candidates", default=3)
-    budget = IntPrompt.ask("  Budget (votes per ballot)", default=1)
+    while True:
+        budget = IntPrompt.ask("  Budget (votes per ballot)", default=10)
+        if budget >= 1:
+            break
+        console.print("[red]  Budget must be a positive integer.[/]")
     voting_window_hours = IntPrompt.ask("  Voting window (hours from now)", default=24)
     self_submit_fee = IntPrompt.ask("  Self-submit fee in wei (0 to disable)", default=0)
 
@@ -557,6 +564,7 @@ def create_election_on_chain_tui():
         return
 
     _chain_state["elections"].append(election_addr)
+    _chain_state["candidate_names"] = []
 
     election = ElectionClient(_chain_state["chain"], election_addr)
     info = election.get_election()
@@ -571,6 +579,40 @@ def create_election_on_chain_tui():
         border_style="green",
         box=box.ROUNDED,
     ))
+
+
+def enter_candidate_names_tui():
+    """Prompt for human-readable candidate names for the latest election."""
+    console.print()
+    console.print(Rule("[bold cyan]Enter candidate names[/]", style="cyan"))
+    console.print()
+
+    if _chain_state["chain"] is None or not _chain_state["elections"]:
+        console.print("[yellow]  Start chain (1) and publish an election (2) first.[/]")
+        return
+
+    election_addr = _chain_state["elections"][-1]
+    election = ElectionClient(_chain_state["chain"], election_addr)
+    info = election.get_election()
+    num_cand = int(info["config"]["numCandidates"])
+
+    existing = _chain_state.get("candidate_names") or []
+    names: list[str] = []
+    for j in range(num_cand):
+        default = existing[j] if j < len(existing) else f"Candidate {j}"
+        name = Prompt.ask(f"  Candidate {j} name", default=default).strip()
+        if not name:
+            name = f"Candidate {j}"
+        names.append(name)
+
+    _chain_state["candidate_names"] = names
+
+    tbl = Table(box=box.ROUNDED, border_style="cyan", title="[bold]Candidate names[/]")
+    tbl.add_column("index", style="bold cyan")
+    tbl.add_column("name", style="white")
+    for j, name in enumerate(names):
+        tbl.add_row(str(j), name)
+    console.print(tbl)
 
 
 def stop_chain_tui():
@@ -608,61 +650,81 @@ def vote_tui(host: str):
     wr_url = "http://127.0.0.1:5300"
     rpc_url = _chain_state["anvil"].rpc_url
 
+    stored = _chain_state.get("candidate_names") or []
+    candidate_names = [
+        stored[j] if j < len(stored) else f"Candidate {j}"
+        for j in range(num_cand)
+    ]
+
+    cand_tbl = Table(box=box.SIMPLE, border_style="green",
+                     title="[bold]Candidates[/]", title_style="bold green")
+    cand_tbl.add_column("index", style="bold cyan")
+    cand_tbl.add_column("name", style="white")
+    for j, name in enumerate(candidate_names):
+        cand_tbl.add_row(str(j), name)
+
     console.print(Panel(
         f"[bold]Election:[/] [dim]{election_addr}[/]\n"
         f"[bold]Candidates:[/] {num_cand}   [bold]Budget:[/] {budget}\n"
         f"[bold]Vote proxy:[/] [dim]{proxy_url}[/]\n"
         f"[bold]WR oracle:[/] [dim]{wr_url}[/]\n"
-        f"[dim]Single-choice demo: enter choices in [0, {num_cand - 1}].[/]",
+        f"[dim]Each ballot is a vector of {num_cand} non-negative ints summing to {budget}.[/]",
         border_style="green",
         box=box.ROUNDED,
     ))
+    console.print(cand_tbl)
 
-    n_votes = IntPrompt.ask("  How many votes to submit?", default=1)
-    if n_votes <= 0:
+    n_voters = IntPrompt.ask("  How many voters?", default=1)
+    if n_voters <= 0:
         console.print("[dim]Cancelled.[/]")
         return
 
-    if budget != 1:
-        console.print(
-            f"[yellow]  This TUI voting helper currently supports budget=1 only.[/]\n"
-            f"  [dim]This election has budget={budget}. Use `voter.py vote --votes ...` manually.[/]",
-        )
-        return
-
-    choices_line = Prompt.ask(
-        f"  Voting choices (space-separated, {n_votes} numbers)",
-        default=" ".join(["0"] * n_votes),
-    ).strip()
-    try:
-        choices = [int(x) for x in choices_line.split()] if choices_line else []
-    except ValueError:
-        console.print("[red]  Invalid input: expected integers separated by spaces.[/]")
-        return
-    if len(choices) != n_votes:
-        console.print(f"[red]  Expected {n_votes} choices, got {len(choices)}.[/]")
-        return
-    for c in choices:
-        if c < 0 or c >= num_cand:
-            console.print(f"[red]  Choice {c} not in [0, {num_cand - 1}].[/]")
-            return
+    default_vec = [budget] + [0] * (num_cand - 1)
+    default_str = " ".join(str(v) for v in default_vec)
 
     ok = 0
-    for i, c in enumerate(choices, start=1):
-        vote_vector = [0] * num_cand
-        vote_vector[c] = 1
-        console.print(f"  [dim]Submitting vote {i}/{n_votes} (choice {c})…[/]")
+    for v_idx in range(1, n_voters + 1):
+        console.print()
+        console.print(Rule(f"[bold]Voter {v_idx}/{n_voters}[/]", style="green"))
+        console.print(cand_tbl)
+        while True:
+            line = Prompt.ask(
+                f"  Voter {v_idx} ballot — {num_cand} ints summing to {budget} "
+                f"(space- or comma-separated)",
+                default=default_str,
+            ).strip()
+            tokens = line.replace(",", " ").split()
+            try:
+                vec = [int(x) for x in tokens]
+            except ValueError:
+                console.print("[red]  Invalid input: expected integers.[/]")
+                continue
+            if len(vec) != num_cand:
+                console.print(f"[red]  Expected {num_cand} values, got {len(vec)}.[/]")
+                continue
+            if any(v < 0 or v > budget for v in vec):
+                console.print(f"[red]  Each value must be in [0, {budget}].[/]")
+                continue
+            if sum(vec) != budget:
+                console.print(f"[red]  Vector must sum to {budget}, got {sum(vec)}.[/]")
+                continue
+            break
+
+        breakdown = ", ".join(
+            f"{candidate_names[j]}={vec[j]}" for j in range(num_cand) if vec[j] > 0
+        ) or "(empty)"
+        console.print(f"  [dim]Submitting Voter {v_idx} ballot: {breakdown}…[/]")
         if voter.cast_vote_via_proxy(
             proxy_url,
             rpc_url,
             election_addr,
-            vote_vector,
+            vec,
             wr_url=wr_url,
         ):
             ok += 1
 
     console.print(Panel(
-        f"[bold green]✓ Submitted {ok}/{n_votes} votes[/]",
+        f"[bold green]✓ Submitted {ok}/{n_voters} ballots[/]",
         border_style="green",
         box=box.ROUNDED,
     ))
@@ -856,20 +918,21 @@ def main_menu(keyper_urls, host):
         console.print()
         console.print("  [bold cyan]1[/]  Start chain (anvil + KeyperSet + Registry)")
         console.print("  [bold cyan]2[/]  Create election on chain (publishElection)")
-        console.print("  [bold green]3[/]  Start services (keypers + vote proxy + WR oracle + Tally Aggregator)")
-        console.print("  [bold cyan]4[/]  Run DKG coordinator (incl. publish on-chain)")
-        console.print("  [bold green]5[/]  Cast votes (via vote proxy)")
-        console.print("  [bold yellow]6[/]  Fast-forward time to votingEnd")
-        console.print("  [bold cyan]7[/]  Show aggregate (on-chain)")
-        console.print("  [bold green]8[/]  Keypers submit decryption shares (on-chain)")
-        console.print("  [bold cyan]9[/]  Show result (on-chain)")
-        console.print("  [bold yellow]0[/]  Stop chain")
+        console.print("  [bold cyan]3[/]  Enter candidate names")
+        console.print("  [bold green]4[/]  Start services (keypers + vote proxy + WR oracle + Tally Aggregator)")
+        console.print("  [bold cyan]5[/]  Run DKG coordinator (incl. publish on-chain)")
+        console.print("  [bold green]6[/]  Cast votes (via vote proxy)")
+        console.print("  [bold yellow]7[/]  Fast-forward time to votingEnd")
+        console.print("  [bold cyan]8[/]  Show aggregate (on-chain)")
+        console.print("  [bold green]9[/]  Keypers submit decryption shares (on-chain)")
+        console.print("  [bold cyan]0[/]  Show result (on-chain)")
+        console.print("  [bold yellow]s[/]  Stop chain")
         console.print("  [bold magenta]q[/]  Quit")
         console.print()
 
         choice = Prompt.ask(
             "[bold]Select[/]",
-            choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "q"],
+            choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "s", "q"],
             default="1",
         )
 
@@ -879,20 +942,22 @@ def main_menu(keyper_urls, host):
             elif choice == "2":
                 create_election_on_chain_tui()
             elif choice == "3":
-                start_services_tui(keyper_urls, host=host)
+                enter_candidate_names_tui()
             elif choice == "4":
-                run_dkg_tui(keyper_urls)
+                start_services_tui(keyper_urls, host=host)
             elif choice == "5":
-                vote_tui(host)
+                run_dkg_tui(keyper_urls)
             elif choice == "6":
-                fast_forward_to_voting_end_tui()
+                vote_tui(host)
             elif choice == "7":
-                show_aggregate_tui()
+                fast_forward_to_voting_end_tui()
             elif choice == "8":
-                submit_decryption_shares_tui(keyper_urls)
+                show_aggregate_tui()
             elif choice == "9":
-                show_result_tui()
+                submit_decryption_shares_tui(keyper_urls)
             elif choice == "0":
+                show_result_tui()
+            elif choice == "s":
                 stop_chain_tui()
             elif choice == "q":
                 if _chain_state["anvil"] is not None:

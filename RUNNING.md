@@ -56,6 +56,7 @@ short-lived CLIs:
 | `keyper.py × N`       | Threshold committee members; run DKG over signed P2P HTTP (commitments + shares); publish DKG result + decryption shares on chain. |
 | `wr_oracle.py`        | Dev Wahlregister-Server stub; signs ballot attestations on G1     |
 | `vote_proxy.py`       | Dev stub holding `VOTE_PROXY_ROLE`; forwards ballots              |
+| `dkg_coordinator.py` (CLI / lib) | Orchestrates keyper DKG HTTP APIs and triggers on-chain DKG publication. |
 | voter (CLI)           | Encrypts, signs, attests, and submits ballots through the proxy   |
 | `tally_aggregator.py` (CLI / lib) | Holds `TALLY_AGGREGATOR_ROLE`; verifies ballots, publishes aggregate, finalises result. Library-only — no Flask. |
 
@@ -66,9 +67,6 @@ voter Schnorr signature, and WR attestation against the on-chain
 WR oracle's public key (the `chain_setup.publish_election` helper
 takes `pk_wr=` for this).
 
-`backend.py` is **off-chain only** now — it hosts the legacy Flask
-state machine that the off-chain test suite still exercises, but plays
-no role in the on-chain pipeline.
 
 ### 3a. Interactive — via the admin TUI (recommended for demos)
 
@@ -79,13 +77,18 @@ cd src
 
 From the menu:
 
-1. Press **`c`** — Start chain (anvil + KeyperSet + Registry). Logs the
-   admin / tally aggregator / vote proxy / per-keyper addresses.
-2. Press **`e`** — Create election (publishElection wizard). Walks
-   through `numCandidates`, `budget`, voting window, fee.
-3. Press **`x`** when done — terminates anvil.
+1. Press **`1`** — Start chain (anvil + KeyperSet + Registry)
+2. Press **`2`** — Create election on chain (publishElection)
+3. Press **`3`** — Start services (keypers + vote proxy + WR oracle + tally aggregator)
+4. Press **`4`** — Run DKG coordinator (incl. publish on-chain)
+5. Press **`5`** — Cast votes (via vote proxy)
+6. Press **`6`** — Fast-forward time to votingEnd
+7. Press **`7`** — Show aggregate (on-chain)
+8. Press **`8`** — Keypers submit decryption shares (on-chain)
+9. Press **`9`** — Show result (on-chain)
+10. Press **`0`** — Stop chain
+11. Press **`q`** — Quit
 
-The TUI does not yet auto-launch the keyper / proxy / backend processes
 in chain mode — for the full lifecycle, run them separately as in §3b
 below, pointing them at the addresses the TUI logged.
 
@@ -141,9 +144,6 @@ VOTE_PROXY_PRIVATE_KEY=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a80
     --port 5400
 
 ```
-
-(`backend.py` is **not** part of the on-chain pipeline — it's the
-off-chain Flask process for the legacy test suite. Skip it for chain runs.)
 
 Now drive the lifecycle (any shell). DKG orchestration still uses the
 keyper HTTP endpoints directly:
@@ -202,11 +202,10 @@ cd src
   --wr http://127.0.0.1:5300 \
   vote --choice 1
 
-# After votingEnd: aggregator publishes, keypers post shares, aggregator finalises.
-TALLY_AGGREGATOR_PRIVATE_KEY=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d \
-  ../.venv/bin/python tally_aggregator.py aggregate \
-    --rpc-url http://127.0.0.1:8545 \
-    --election $ELECTION_ADDR
+# Use ``daemon`` to combine: aggregate, poll for shares, finalize. It can be run even before voting ends. It waits until voting ends.
+TALLY_AGGREGATOR_PRIVATE_KEY=0x... \
+  ../.venv/bin/python tally_aggregator.py daemon \
+    --rpc-url http://127.0.0.1:8545 --election $ELECTION_ADDR --poll 2 --timeout 300
 
 for kid in 1 2 3; do
   curl -X POST http://127.0.0.1:500$kid/decrypt/publish_on_chain \
@@ -214,26 +213,10 @@ for kid in 1 2 3; do
     -d "{\"election_address\":\"$ELECTION_ADDR\"}"
 done
 
-TALLY_AGGREGATOR_PRIVATE_KEY=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d \
-  ../.venv/bin/python tally_aggregator.py finalize \
-    --rpc-url http://127.0.0.1:8545 \
-    --election $ELECTION_ADDR
-
-# Or use ``auto`` to combine: aggregate, poll for shares, finalize.
-TALLY_AGGREGATOR_PRIVATE_KEY=0x... \
-  ../.venv/bin/python tally_aggregator.py auto \
-    --rpc-url http://127.0.0.1:8545 --election $ELECTION_ADDR --poll 2 --timeout 300
-
 # Read the final tally.
 ../.venv/bin/python voter.py \
   --rpc-url http://127.0.0.1:8545 --election $ELECTION_ADDR result
 ```
-
-### 3c. Legacy off-chain pipeline
-
-The original Flask-only pipeline still works end-to-end without anvil
-or contracts. See [`README.md`](README.md) §"Run an election manually"
-or use the admin TUI options `0`–`7` (the off-chain numeric submenu).
 
 ## 4. Running tests
 
@@ -267,16 +250,13 @@ cd src
 ```
 
 ```sh
-# 4e. Legacy off-chain Flask tests (still pass individually; flaky
-# under parallel runs due to fixed-port collisions — that flakiness
-# pre-dates the migration).
-../.venv/bin/python -m pytest tests/test_e2e.py tests/test_security_fixes.py -v
-```
+#4e. Security tests
+../.venv/bin/python tests/test_security_fixes.py
 
-```sh
-# 4f. Stress + perf benchmarks (off-chain).
+# 4f. Stress + perf benchmarks (on-chain).
 ../.venv/bin/python tests/test_stress.py
 ../.venv/bin/python tests/test_tally_perf.py
+
 ```
 
 ### Cross-implementation interop fixtures
@@ -319,8 +299,8 @@ fixtures/                   SDK-verified cross-impl test vectors
 scripts/gen_share_fixture.py  Regenerate fixtures from the live DKG
 src/
   keyper.py                 DKG (signed P2P commitments + shares) + on-chain submitDecryptionShare
-  backend.py                Off-chain Flask backend (legacy test path only)
   tally_aggregator.py       On-chain tally aggregator (library + CLI; PLAN.md decision E)
+  dkg_coodinator.py         coordinates the entire dkg process among keypers
   vote_proxy.py             Dev-only ballot forwarder
   wr_oracle.py              Dev Wahlregister-Server stub (Schnorr on G1)
   voter.py                  Voter CLI: builds real ballot via sdk_compat.build_ballot
@@ -331,7 +311,6 @@ src/
   crypto/                   BLS12-381, ElGamal, DKG, ZK proofs (off-chain core)
   tests/
     test_e2e_onchain.py     On-chain e2e (4 tests)
-    test_e2e.py             Legacy off-chain e2e
     test_comprehensive.py   Pure crypto unit + integration (78 tests)
     test_compressed_codecs.py  G1/G2 zcash-format codec
     test_sdk_compat.py      SDK transcript + DLEQ + cross-impl fixtures
