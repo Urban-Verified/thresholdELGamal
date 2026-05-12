@@ -25,7 +25,7 @@ is handled by `forge script` against a local clone of the contracts repo.
 ## Source commit
 
 [`Urban-Verified/bulletin-board`](https://github.com/Urban-Verified/bulletin-board)
-@ `942ae497af18d5d560316e9cea7aae39644e49f6` (captured at vendor time).
+@ `ed8f0b9b6a5fe23a38c9b2ceb061ff0f47910443` (captured at vendor time).
 
 ## Refresh
 

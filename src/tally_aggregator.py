@@ -195,7 +195,7 @@ def aggregate(
         for j in range(num_cand)
     ]
     try:
-        receipt = election.publish_aggregate(aggregate_bytes, b"", signer=signer)
+        receipt = election.publish_aggregate(aggregate_bytes, signer=signer)
     except Exception as e:
         raise TallyAggregatorError(f"publishAggregate reverted: {e}") from e
 

@@ -362,22 +362,17 @@ class ElectionClient(_BaseClient):
     def publish_aggregate(
         self,
         aggregates: Iterable[tuple[bytes, bytes]],
-        proof: bytes,
         *,
         signer: LocalAccount | None = None,
     ) -> dict:
-        tally = (
-            [(bytes(c[0]), bytes(c[1])) for c in aggregates],
-            bytes(proof),
-        )
+        tally = ([(bytes(c[0]), bytes(c[1])) for c in aggregates],)
         fn = self.contract.functions.publishAggregate(tally)
         return self.chain.send(fn, signer=signer)
 
     def get_aggregate(self) -> dict:
-        aggregates, proof = self.contract.functions.getAggregate().call()
+        (aggregates,) = self.contract.functions.getAggregate().call()
         return {
             "aggregates": [(bytes(c[0]), bytes(c[1])) for c in aggregates],
-            "proof": bytes(proof),
         }
 
     def publish_result(

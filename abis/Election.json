@@ -166,11 +166,6 @@
                 "internalType": "bytes"
               }
             ]
-          },
-          {
-            "name": "proof",
-            "type": "bytes",
-            "internalType": "bytes"
           }
         ]
       }
@@ -626,11 +621,6 @@
                 "internalType": "bytes"
               }
             ]
-          },
-          {
-            "name": "proof",
-            "type": "bytes",
-            "internalType": "bytes"
           }
         ]
       }
