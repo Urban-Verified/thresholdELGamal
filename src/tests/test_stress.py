@@ -1,223 +1,220 @@
-#!/usr/bin/env python3
 """
-Stress test: 10 candidates, budget=10, 10000 randomized votes.
-Starts servers in-process, submits votes, tallies, and verifies correctness.
+On-chain stress smoke test.
+
+Exercises: publishElection → keyper DKG → vote proxy submissions → aggregate →
+keyper decryption shares → finalize → assert tally.
+
+We keep NUM_VOTES moderate to avoid tx-throughput flakiness.
 """
 
+from __future__ import annotations
+
+import logging
+import os
 import random
+import socket
+import sys
 import threading
 import time
-import sys
-import os
-import logging
+
+import pytest
 import requests
 
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from keyper import create_keyper_app
-from backend import create_backend_app
-from bulletin_board import create_bb_app
-from crypto.primitives import CURVE_ORDER, point_to_dict, dict_to_point
-from crypto.elgamal import encrypt, aggregate_ciphertexts
-from crypto.proofs import prove_range, prove_exact_budget
+from eth_account import Account  # noqa: E402
+from chain_setup import (  # noqa: E402
+    ANVIL_KEYS,
+    anvil_address,
+    deploy_keyper_set,
+    deploy_registry,
+    publish_election,
+    start_anvil,
+    stop_anvil,
+)
+from eth_client import ElectionClient, EthChain  # noqa: E402
+from keyper import create_keyper_app  # noqa: E402
+from vote_proxy import create_vote_proxy_app  # noqa: E402
+from voter import cast_vote_via_proxy, _fetch_wr_attestation  # noqa: E402
+from wr_oracle import create_wr_oracle_app  # noqa: E402
+from sdk_compat import schnorr_keygen  # noqa: E402
+from crypto.primitives import g1_to_compressed, g2_from_compressed  # noqa: E402
+from sdk_compat import build_ballot, election_id_to_bytes32  # noqa: E402
+import tally_aggregator  # noqa: E402
 
-NUM_CANDIDATES = 10
-BUDGET = 10
-NUM_VOTES = 100
-N_KEYPERS = 3
-THRESHOLD = 1  # need t+1 = 2 for decryption
 
-BACKEND_PORT = 9000
-KEYPER_BASE_PORT = 9001
-BB_PORT = 9099
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
-def start_flask(app, port):
+def _serve(app, port: int, host: str = "127.0.0.1") -> threading.Thread:
     t = threading.Thread(
-        target=lambda: app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False),
+        target=lambda: app.run(host=host, port=port, debug=False, use_reloader=False),
         daemon=True,
     )
     t.start()
     return t
 
 
-def wait_for(url, retries=40, delay=0.25):
+def _wait_http(url: str, retries: int = 80, delay: float = 0.05) -> None:
     for _ in range(retries):
         try:
-            requests.get(url, timeout=1)
-            return True
+            requests.get(url, timeout=0.5)
+            return
         except requests.exceptions.ConnectionError:
             time.sleep(delay)
-    return False
+    raise TimeoutError(f"server at {url} never came up")
 
 
-def random_vote_vector(num_candidates, budget):
-    """Generate a random vote vector summing to exactly budget."""
-    vec = [0] * num_candidates
-    for _ in range(budget):
-        vec[random.randint(0, num_candidates - 1)] += 1
-    return vec
-
-
-def submit_vote(backend_url, vote_vector, election_id, mpk, B):
-    """Encrypt + prove + submit a single vote. Returns response JSON."""
-    num_candidates = len(vote_vector)
-
-    ciphertexts = []
-    randomnesses = []
-    for v in vote_vector:
-        C1, C2, r = encrypt(mpk, v)
-        ciphertexts.append((C1, C2))
-        randomnesses.append(r)
-
-    range_proofs = []
-    for j in range(num_candidates):
-        proof = prove_range(mpk, ciphertexts[j][0], ciphertexts[j][1],
-                            vote_vector[j], randomnesses[j], B, election_id=election_id)
-        range_proofs.append(proof)
-
-    agg = aggregate_ciphertexts(ciphertexts)
-    r_sum = sum(randomnesses) % CURVE_ORDER
-    budget_proof = prove_exact_budget(mpk, agg[0], agg[1], B, r_sum, election_id=election_id)
-
-    payload = {
-        "ciphertexts": [
-            {"c1": point_to_dict(ct[0]), "c2": point_to_dict(ct[1])}
-            for ct in ciphertexts
-        ],
-        "range_proofs": [
-            [{"e": str(e), "z": str(z)} for (e, z) in proof]
-            for proof in range_proofs
-        ],
-        "budget_proof": {"e": str(budget_proof[0]), "z": str(budget_proof[1])},
-    }
-
-    resp = requests.post(f"{backend_url}/election/vote", json=payload, timeout=60)
-    return resp.json()
-
-
-def main():
-    random.seed(42)  # reproducible
-    backend_url = f"http://127.0.0.1:{BACKEND_PORT}"
-    bb_url = f"http://127.0.0.1:{BB_PORT}"
-
-    # --- Start servers ---
-    print(f"Starting {N_KEYPERS} keypers, bulletin board, and backend...")
-    bb_app = create_bb_app()
-    start_flask(bb_app, BB_PORT)
-
-    keyper_urls = []
-    for i in range(N_KEYPERS):
-        port = KEYPER_BASE_PORT + i
-        app = create_keyper_app(i + 1)
-        start_flask(app, port)
-        keyper_urls.append(f"http://127.0.0.1:{port}")
-
-    backend_app = create_backend_app(keyper_urls, bb_url)
-    start_flask(backend_app, BACKEND_PORT)
-
-    assert wait_for(f"{bb_url}/bb/status"), "Bulletin board not ready"
+def _run_dkg(*, keyper_urls: list[str], keyper_addrs: list[str], election_id: str, election_address: str) -> None:
+    url_map = {str(i + 1): keyper_urls[i] for i in range(3)}
+    for kid, url in zip([1, 2, 3], keyper_urls):
+        r = requests.post(
+            f"{url}/dkg/round1",
+            json={"n": 3, "t": 1, "keyper_id": kid, "election_id": election_id, "members": keyper_addrs},
+            timeout=20,
+        ).json()
+        assert r.get("status") == "ok", r
     for url in keyper_urls:
-        assert wait_for(f"{url}/status"), f"Keyper {url} not ready"
-    assert wait_for(f"{backend_url}/election/status"), "Backend not ready"
-    print("All servers ready.")
-
-    # --- Create election ---
-    candidate_names = [f"Candidate_{i}" for i in range(NUM_CANDIDATES)]
-    resp = requests.post(f"{backend_url}/election/create", json={
-        "n": N_KEYPERS, "t": THRESHOLD,
-        "num_candidates": NUM_CANDIDATES, "budget": BUDGET,
-        "candidate_names": candidate_names,
-    }, timeout=30)
-    assert resp.status_code == 200, f"Create failed: {resp.text}"
-    print(f"Election created: {NUM_CANDIDATES} candidates, B={BUDGET}")
-
-    # --- DKG ---
-    print("Running DKG...", end=" ", flush=True)
-    t0 = time.time()
-    resp = requests.post(f"{backend_url}/election/dkg", timeout=300)
-    assert resp.status_code == 200, f"DKG failed: {resp.text}"
-    print(f"done in {time.time()-t0:.1f}s")
-
-    # Fetch params once for all votes
-    params = requests.get(f"{backend_url}/election/params", timeout=5).json()
-    mpk = dict_to_point(params["mpk"])
-    election_id = params.get("election_id", "")
-
-    # --- Generate all random votes and track expected tally ---
-    print(f"Generating {NUM_VOTES} random vote vectors...")
-    expected_tally = [0] * NUM_CANDIDATES
-    vote_vectors = []
-    for _ in range(NUM_VOTES):
-        vec = random_vote_vector(NUM_CANDIDATES, BUDGET)
-        vote_vectors.append(vec)
-        for j in range(NUM_CANDIDATES):
-            expected_tally[j] += vec[j]
-
-    print(f"Expected tally: {expected_tally}")
-    print(f"Expected total:  {sum(expected_tally)} (should be {NUM_VOTES * BUDGET})")
-
-    # --- Submit votes ---
-    print(f"Submitting {NUM_VOTES} votes...", flush=True)
-    t0 = time.time()
-    accepted = 0
-    rejected = 0
-    for i, vec in enumerate(vote_vectors):
-        t_vote = time.time()
-        result = submit_vote(backend_url, vec, election_id, mpk, BUDGET)
-        vote_dur = time.time() - t_vote
-        if result.get("status") == "ok":
-            accepted += 1
-        else:
-            rejected += 1
-            print(f"  Vote {i} REJECTED: {result.get('error', '?')}", flush=True)
-
-        elapsed = time.time() - t0
-        rate = (i + 1) / elapsed
-        eta = (NUM_VOTES - i - 1) / rate if rate > 0 else 0
-        print(f"  [{i+1}/{NUM_VOTES}] {vote_dur:.1f}s this vote | {rate:.2f} votes/s avg | ETA {eta:.0f}s", flush=True)
-
-    vote_time = time.time() - t0
-    print(f"Voting done: {accepted} accepted, {rejected} rejected in {vote_time:.1f}s "
-          f"({accepted/vote_time:.1f} votes/s)")
-
-    if rejected > 0:
-        print(f"ERROR: {rejected} votes rejected!")
-        sys.exit(1)
-
-    # --- Tally ---
-    print("Running tally (homomorphic aggregation + threshold decryption)...", end=" ", flush=True)
-    t0 = time.time()
-    resp = requests.post(f"{backend_url}/election/tally", timeout=600)
-    tally_time = time.time() - t0
-    assert resp.status_code == 200, f"Tally failed: {resp.text}"
-    results = resp.json()["results"]
-    print(f"done in {tally_time:.1f}s")
-
-    # --- Verify ---
-    print(f"\n{'Candidate':<15} {'Expected':>8} {'Got':>8} {'Match':>6}")
-    print("-" * 40)
-    all_match = True
-    for j in range(NUM_CANDIDATES):
-        name = candidate_names[j]
-        exp = expected_tally[j]
-        got = results[name]
-        match = "OK" if got == exp else "FAIL"
-        if got != exp:
-            all_match = False
-        print(f"{name:<15} {exp:>8} {got:>8} {match:>6}")
-
-    print("-" * 40)
-    if all_match:
-        print(f"ALL CORRECT — {NUM_VOTES} votes, {NUM_CANDIDATES} candidates, B={BUDGET}")
-        print(f"Timings: DKG={resp.elapsed.total_seconds() if hasattr(resp, 'elapsed') else '?'}s, "
-              f"Voting={vote_time:.1f}s, Tally={tally_time:.1f}s")
-    else:
-        print("MISMATCH DETECTED — tally does not match expected values!")
-        sys.exit(1)
+        assert requests.post(
+            f"{url}/dkg/distribute_commitments", json={"keyper_urls": url_map}, timeout=30,
+        ).json().get("status") == "ok"
+    for url in keyper_urls:
+        assert requests.post(
+            f"{url}/dkg/distribute_shares", json={"keyper_urls": url_map}, timeout=30,
+        ).json().get("status") == "ok"
+    for url in keyper_urls:
+        assert requests.post(
+            f"{url}/dkg/round2", json={"election_id": election_id}, timeout=30,
+        ).json().get("verified")
+    for url in keyper_urls:
+        r = requests.post(
+            f"{url}/dkg/publish_on_chain", json={"election_address": election_address, "n": 3}, timeout=30,
+        ).json()
+        assert "error" not in r, r
 
 
-if __name__ == "__main__":
-    main()
+@pytest.mark.parametrize("num_votes", [30])
+def test_onchain_stress_smoke(num_votes: int) -> None:
+    random.seed(42)
+    anvil = start_anvil(port=_free_port(), log_path="/tmp/anvil-stress.log")
+    try:
+        admin_key = ANVIL_KEYS[0]
+        tally_key = ANVIL_KEYS[1]
+        proxy_key = ANVIL_KEYS[2]
+        keyper_keys = list(ANVIL_KEYS[3:6])
+        keyper_addrs = [anvil_address(k) for k in keyper_keys]
+
+        chain = EthChain.connect(anvil.rpc_url, private_key=admin_key)
+        ks = deploy_keyper_set(rpc_url=anvil.rpc_url, deployer_key=admin_key, members=keyper_addrs, threshold=2)
+        reg = deploy_registry(rpc_url=anvil.rpc_url, deployer_key=admin_key, admin=anvil_address(admin_key))
+
+        # WR oracle (deterministic)
+        wr_sk_int = int.from_bytes(b"WR-stress" + b"\x00" * 24, "big") + 1
+        _, wr_vk = schnorr_keygen(wr_sk_int)
+        wr_pk = g1_to_compressed(wr_vk)
+        wr_port = _free_port()
+        _serve(create_wr_oracle_app(private_key=wr_sk_int), wr_port)
+        wr_url = f"http://127.0.0.1:{wr_port}"
+        _wait_http(f"{wr_url}/status")
+
+        now = int(chain.w3.eth.get_block("latest")["timestamp"])
+        voting_end = now + 25
+        election_address = publish_election(
+            chain=chain,
+            registry_address=reg,
+            keyper_set_address=ks,
+            voting_start=now - 60,
+            voting_end=voting_end,
+            num_candidates=3,
+            budget=1,
+            self_submit_fee=0,
+            pk_wr=wr_pk,
+            tally_aggregator=anvil_address(tally_key),
+            vote_proxy=anvil_address(proxy_key),
+        )
+        election = ElectionClient(chain, election_address)
+
+        keyper_ports = [_free_port(), _free_port(), _free_port()]
+        keyper_urls = [f"http://127.0.0.1:{p}" for p in keyper_ports]
+        for kid, port, key in zip([1, 2, 3], keyper_ports, keyper_keys):
+            _serve(create_keyper_app(kid, chain_config={"rpc_url": anvil.rpc_url, "private_key": key}), port)
+        proxy_port = _free_port()
+        proxy_url = f"http://127.0.0.1:{proxy_port}"
+        _serve(create_vote_proxy_app(rpc_url=anvil.rpc_url, private_key=proxy_key, default_election_address=election_address), proxy_port)
+        for url in keyper_urls:
+            _wait_http(f"{url}/status")
+        _wait_http(f"{proxy_url}/status")
+
+        eid = f"stress-{election_address[2:10]}"
+        _run_dkg(keyper_urls=keyper_urls, keyper_addrs=keyper_addrs, election_id=eid, election_address=election_address)
+        assert election.is_dkg_finalized()
+
+        expected = [0, 0, 0]
+        for _ in range(num_votes):
+            choice = random.randint(0, 2)
+            vec = [0, 0, 0]
+            vec[choice] = 1
+            expected[choice] += 1
+            assert cast_vote_via_proxy(proxy_url, anvil.rpc_url, election_address, vec, wr_url=wr_url)
+        assert election.get_num_ballots() == num_votes
+
+        # Submit one additional ballot that is structurally valid but has a
+        # tampered WR attestation. Contract accepts (length checks), but the
+        # tally aggregator must reject it during aggregate verification.
+        info = election.get_election()
+        mpk = g2_from_compressed(info["dkg"]["pkElection"])
+        eid_bytes = election_id_to_bytes32(info["config"]["electionId"])
+        pseudonym = os.urandom(32)
+        sk, vk = schnorr_keygen()
+        vk_bytes = g1_to_compressed(vk)
+        attest = _fetch_wr_attestation(wr_url, eid_bytes, pseudonym, vk_bytes)
+        tampered = bytearray(attest)
+        tampered[0] ^= 0x01
+        built = build_ballot(
+            mpk=mpk,
+            election_id=eid_bytes,
+            pseudonym=pseudonym,
+            sk=sk,
+            vk=vk,
+            votes=[1, 0, 0],
+            num_candidates=3,
+            budget=1,
+        )
+        bad_payload = {
+            "election_address": election_address,
+            "ballot": {
+                "pseudonym": built.pseudonym.hex(),
+                "vk": built.vk.hex(),
+                "ciphertexts": [{"c1": c1.hex(), "c2": c2.hex()} for (c1, c2) in built.ciphertexts],
+                "zkProof": built.zk_proof.hex(),
+                "voterSignature": built.voter_signature.hex(),
+                "wrAttestation": bytes(tampered).hex(),
+            },
+        }
+        r = requests.post(f"{proxy_url}/vote", json=bad_payload, timeout=30)
+        assert r.status_code == 200, r.text
+        assert election.get_num_ballots() == num_votes + 1
+
+        chain.w3.provider.make_request("anvil_setNextBlockTimestamp", [voting_end + 1])
+        chain.w3.provider.make_request("anvil_mine", [1])
+
+        signer = Account.from_key(tally_key)
+        agg = tally_aggregator.aggregate(chain, election_address, signer)
+        assert agg.ballots_total == num_votes + 1
+        assert agg.ballots_admitted == num_votes
+        assert agg.ballots_rejected == 1
+        assert "wrAttestation" in agg.rejections[0]["reason"]
+        for url in keyper_urls:
+            r = requests.post(f"{url}/decrypt/publish_on_chain", json={"election_address": election_address}, timeout=60).json()
+            assert "error" not in r, r
+
+        fin = tally_aggregator.finalize(chain, election_address, signer)
+        assert fin.totals == expected
+        assert election.get_result()["tally"] == expected
+    finally:
+        stop_anvil(anvil)

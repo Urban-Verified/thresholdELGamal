@@ -14,16 +14,9 @@ Run:
 """
 
 import unittest
-import threading
-import time
 import math
 import sys
 import os
-import logging
-import requests
-
-# Suppress Flask/werkzeug noise during tests
-logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -44,6 +37,7 @@ from crypto.proofs import (
     prove_exact_budget, verify_exact_budget,
     prove_decryption_share, verify_decryption_share,
 )
+import sdk_compat
 
 
 # ======================================================================
@@ -86,6 +80,59 @@ class TestPointArithmetic(unittest.TestCase):
         P = point_multiply(G2, 42)
         neg_P = point_neg(P)
         self.assertTrue(is_identity(point_add(P, neg_P)))
+
+
+# ======================================================================
+#  SDK compatibility: negative cases
+# ======================================================================
+
+class TestSdkCompatNegative(unittest.TestCase):
+    def test_verify_ballot_fails_on_wrong_election_id(self):
+        """Ballot signature/zkProof are bound to electionId via the transcript."""
+        from sdk_compat import schnorr_keygen, g1_to_compressed as _g1c
+
+        # Minimal synthetic election context.
+        mpk = point_multiply(G2, 12345)
+        num_candidates = 2
+        budget = 1
+        election_id = sdk_compat.election_id_to_bytes32(42)
+        wrong_election_id = sdk_compat.election_id_to_bytes32(43)
+
+        pseudonym = os.urandom(32)
+        sk, vk = schnorr_keygen()
+        vk_bytes = _g1c(vk)
+
+        # Build a valid ballot for election_id.
+        built = sdk_compat.build_ballot(
+            mpk=mpk,
+            election_id=election_id,
+            pseudonym=pseudonym,
+            sk=sk,
+            vk=vk,
+            votes=[1, 0],
+            num_candidates=num_candidates,
+            budget=budget,
+        )
+
+        # Use a permissive WR verifier so this test isolates electionId binding.
+        def verify_wr(_eid: bytes, _pseudonym: bytes, _vk: bytes, _att: bytes) -> bool:
+            return True
+
+        ok, reason = sdk_compat.verify_ballot(
+            mpk=mpk,
+            election_id=wrong_election_id,
+            pseudonym=pseudonym,
+            vk_bytes=vk_bytes,
+            ciphertext_bytes=built.ciphertexts,
+            zk_proof=built.zk_proof,
+            voter_signature=built.voter_signature,
+            wr_attestation=b"\x01",  # non-empty (required)
+            num_candidates=num_candidates,
+            budget=budget,
+            verify_wr=verify_wr,
+        )
+        self.assertFalse(ok)
+        self.assertIsNotNone(reason)
 
     def test_scalar_mult_distributive(self):
         # (a+b)*G = a*G + b*G
@@ -752,273 +799,6 @@ class TestIntegrationHomomorphicVoting(unittest.TestCase):
             self.assertTrue(verify_decryption_share(C1, mpk_k, sigma, proof),
                             f"Decryption proof failed for keyper {k + 1}")
 
-
-# ======================================================================
-#  6. SYSTEM (E2E) TESTS: HTTP Server Lifecycle
-# ======================================================================
-
-def _start_flask(app, port, host="127.0.0.1"):
-    """Start a Flask app in a daemon thread."""
-    t = threading.Thread(
-        target=lambda: app.run(host=host, port=port, debug=False, use_reloader=False),
-        daemon=True,
-    )
-    t.start()
-    return t
-
-
-def _wait_for(url, retries=30, delay=0.2):
-    """Wait for a server to become available."""
-    for _ in range(retries):
-        try:
-            requests.get(url, timeout=1)
-            return True
-        except requests.exceptions.ConnectionError:
-            time.sleep(delay)
-    return False
-
-
-def _submit_vote_http(backend_url, vote_vector):
-    """Client-side: encrypt, prove, submit via HTTP."""
-    params = requests.get(f"{backend_url}/election/params", timeout=5).json()
-    mpk = dict_to_point(params["mpk"])
-    B = params["budget"]
-    num_cand = params["num_candidates"]
-    election_id = params.get("election_id", "")
-
-    assert len(vote_vector) == num_cand
-    assert sum(vote_vector) == B
-
-    cts = []
-    rands = []
-    for v in vote_vector:
-        C1, C2, r = encrypt(mpk, v)
-        cts.append((C1, C2))
-        rands.append(r)
-
-    range_proofs = []
-    for j in range(num_cand):
-        proof = prove_range(mpk, cts[j][0], cts[j][1], vote_vector[j], rands[j], B, election_id=election_id)
-        range_proofs.append(proof)
-
-    agg = aggregate_ciphertexts(cts)
-    r_sum = sum(rands) % CURVE_ORDER
-    bp = prove_exact_budget(mpk, agg[0], agg[1], B, r_sum, election_id=election_id)
-
-    payload = {
-        "ciphertexts": [
-            {"c1": point_to_dict(ct[0]), "c2": point_to_dict(ct[1])} for ct in cts
-        ],
-        "range_proofs": [
-            [{"e": str(e), "z": str(z)} for (e, z) in proof]
-            for proof in range_proofs
-        ],
-        "budget_proof": {"e": str(bp[0]), "z": str(bp[1])},
-    }
-
-    resp = requests.post(f"{backend_url}/election/vote", json=payload, timeout=30)
-    return resp.json()
-
-
-# Use different port ranges for each E2E test to avoid conflicts
-_PORT_COUNTER = [7000]
-
-
-def _next_ports(n_keypers):
-    """Allocate unique ports for a test (backend + keypers + bulletin board)."""
-    base = _PORT_COUNTER[0]
-    _PORT_COUNTER[0] += n_keypers + 2  # +1 backend, +n_keypers, +1 BB
-    backend_port = base
-    keyper_ports = list(range(base + 1, base + 1 + n_keypers))
-    bb_port = base + 1 + n_keypers
-    return backend_port, keyper_ports, bb_port
-
-
-class TestE2ESingleChoice(unittest.TestCase):
-    """E2E: Single-choice election (B=1) with HTTP servers."""
-
-    @classmethod
-    def setUpClass(cls):
-        from keyper import create_keyper_app
-        from backend import create_backend_app
-        from bulletin_board import create_bb_app
-
-        n_keypers = 3
-        cls.backend_port, cls.keyper_ports, cls.bb_port = _next_ports(n_keypers)
-        cls.backend_url = f"http://127.0.0.1:{cls.backend_port}"
-        cls.keyper_urls = [f"http://127.0.0.1:{p}" for p in cls.keyper_ports]
-        cls.bb_url = f"http://127.0.0.1:{cls.bb_port}"
-
-        bb_app = create_bb_app()
-        _start_flask(bb_app, cls.bb_port)
-
-        for i, port in enumerate(cls.keyper_ports):
-            app = create_keyper_app(i + 1)
-            _start_flask(app, port)
-
-        backend_app = create_backend_app(cls.keyper_urls, cls.bb_url)
-        _start_flask(backend_app, cls.backend_port)
-
-        assert _wait_for(f"{cls.bb_url}/bb/status"), "Bulletin board not ready"
-        for url in cls.keyper_urls:
-            assert _wait_for(f"{url}/status"), f"Keyper at {url} not ready"
-        assert _wait_for(f"{cls.backend_url}/election/status"), "Backend not ready"
-
-    def test_full_single_choice_election(self):
-        """3 candidates, B=1, 5 voters -> expected tally [2, 2, 1]."""
-        resp = requests.post(f"{self.backend_url}/election/create", json={
-            "n": 3, "t": 1, "num_candidates": 3, "budget": 1,
-            "candidate_names": ["Alice", "Bob", "Charlie"],
-        }, timeout=30)
-        self.assertEqual(resp.status_code, 200)
-
-        resp = requests.post(f"{self.backend_url}/election/dkg", timeout=120)
-        self.assertEqual(resp.status_code, 200)
-
-        voter_choices = [[1,0,0], [1,0,0], [0,1,0], [0,1,0], [0,0,1]]
-        for choice in voter_choices:
-            result = _submit_vote_http(self.backend_url, choice)
-            self.assertEqual(result.get("status"), "ok")
-
-        resp = requests.post(f"{self.backend_url}/election/tally", timeout=120)
-        self.assertEqual(resp.status_code, 200)
-        results = resp.json()["results"]
-        self.assertEqual(results["Alice"], 2)
-        self.assertEqual(results["Bob"], 2)
-        self.assertEqual(results["Charlie"], 1)
-
-
-class TestE2EBudgetVote(unittest.TestCase):
-    """E2E: Budget vote (B=3) with HTTP servers."""
-
-    @classmethod
-    def setUpClass(cls):
-        from keyper import create_keyper_app
-        from backend import create_backend_app
-        from bulletin_board import create_bb_app
-
-        n_keypers = 3
-        cls.backend_port, cls.keyper_ports, cls.bb_port = _next_ports(n_keypers)
-        cls.backend_url = f"http://127.0.0.1:{cls.backend_port}"
-        cls.keyper_urls = [f"http://127.0.0.1:{p}" for p in cls.keyper_ports]
-        cls.bb_url = f"http://127.0.0.1:{cls.bb_port}"
-
-        bb_app = create_bb_app()
-        _start_flask(bb_app, cls.bb_port)
-
-        for i, port in enumerate(cls.keyper_ports):
-            app = create_keyper_app(i + 1)
-            _start_flask(app, port)
-
-        backend_app = create_backend_app(cls.keyper_urls, cls.bb_url)
-        _start_flask(backend_app, cls.backend_port)
-
-        assert _wait_for(f"{cls.bb_url}/bb/status"), "Bulletin board not ready"
-        for url in cls.keyper_urls:
-            assert _wait_for(f"{url}/status"), f"Keyper at {url} not ready"
-        assert _wait_for(f"{cls.backend_url}/election/status"), "Backend not ready"
-
-    def test_full_budget_election(self):
-        """3 candidates, B=3, 3 voters -> expected tally [4, 3, 2]."""
-        resp = requests.post(f"{self.backend_url}/election/create", json={
-            "n": 3, "t": 1, "num_candidates": 3, "budget": 3,
-            "candidate_names": ["X", "Y", "Z"],
-        }, timeout=30)
-        self.assertEqual(resp.status_code, 200)
-
-        resp = requests.post(f"{self.backend_url}/election/dkg", timeout=120)
-        self.assertEqual(resp.status_code, 200)
-
-        for votes in [[2,1,0], [1,1,1], [1,1,1]]:
-            result = _submit_vote_http(self.backend_url, votes)
-            self.assertEqual(result.get("status"), "ok")
-
-        resp = requests.post(f"{self.backend_url}/election/tally", timeout=120)
-        self.assertEqual(resp.status_code, 200)
-        results = resp.json()["results"]
-        self.assertEqual(results["X"], 4)
-        self.assertEqual(results["Y"], 3)
-        self.assertEqual(results["Z"], 2)
-
-
-class TestE2ERejectInvalidVote(unittest.TestCase):
-    """E2E: Backend rejects votes with invalid proofs."""
-
-    @classmethod
-    def setUpClass(cls):
-        from keyper import create_keyper_app
-        from backend import create_backend_app
-        from bulletin_board import create_bb_app
-
-        n_keypers = 3
-        cls.backend_port, cls.keyper_ports, cls.bb_port = _next_ports(n_keypers)
-        cls.backend_url = f"http://127.0.0.1:{cls.backend_port}"
-        cls.keyper_urls = [f"http://127.0.0.1:{p}" for p in cls.keyper_ports]
-        cls.bb_url = f"http://127.0.0.1:{cls.bb_port}"
-
-        bb_app = create_bb_app()
-        _start_flask(bb_app, cls.bb_port)
-
-        for i, port in enumerate(cls.keyper_ports):
-            app = create_keyper_app(i + 1)
-            _start_flask(app, port)
-
-        backend_app = create_backend_app(cls.keyper_urls, cls.bb_url)
-        _start_flask(backend_app, cls.backend_port)
-
-        assert _wait_for(f"{cls.bb_url}/bb/status"), "Bulletin board not ready"
-        for url in cls.keyper_urls:
-            assert _wait_for(f"{url}/status"), f"Keyper at {url} not ready"
-        assert _wait_for(f"{cls.backend_url}/election/status"), "Backend not ready"
-
-    def test_reject_tampered_proof(self):
-        """Vote with tampered range proof should be rejected."""
-        resp = requests.post(f"{self.backend_url}/election/create", json={
-            "n": 3, "t": 1, "num_candidates": 2, "budget": 1,
-            "candidate_names": ["Yes", "No"],
-        }, timeout=30)
-        self.assertEqual(resp.status_code, 200)
-
-        resp = requests.post(f"{self.backend_url}/election/dkg", timeout=120)
-        self.assertEqual(resp.status_code, 200)
-
-        params = requests.get(f"{self.backend_url}/election/params", timeout=5).json()
-        mpk = dict_to_point(params["mpk"])
-
-        C1a, C2a, r1 = encrypt(mpk, 1)
-        C1b, C2b, r2 = encrypt(mpk, 0)
-
-        proof1 = prove_range(mpk, C1a, C2a, 1, r1, 1)
-        proof2 = prove_range(mpk, C1b, C2b, 0, r2, 1)
-
-        agg = aggregate_ciphertexts([(C1a, C2a), (C1b, C2b)])
-        r_sum = (r1 + r2) % CURVE_ORDER
-        bp = prove_exact_budget(mpk, agg[0], agg[1], 1, r_sum)
-
-        # Tamper with proof1
-        tampered_proof1 = list(proof1)
-        e, z = tampered_proof1[0]
-        tampered_proof1[0] = ((e + 1) % CURVE_ORDER, z)
-
-        payload = {
-            "ciphertexts": [
-                {"c1": point_to_dict(C1a), "c2": point_to_dict(C2a)},
-                {"c1": point_to_dict(C1b), "c2": point_to_dict(C2b)},
-            ],
-            "range_proofs": [
-                [{"e": str(ei), "z": str(zi)} for (ei, zi) in tampered_proof1],
-                [{"e": str(ei), "z": str(zi)} for (ei, zi) in proof2],
-            ],
-            "budget_proof": {"e": str(bp[0]), "z": str(bp[1])},
-        }
-        resp = requests.post(f"{self.backend_url}/election/vote", json=payload, timeout=30)
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("invalid", resp.json()["error"].lower())
-
-
-# ======================================================================
-#  Main
-# ======================================================================
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

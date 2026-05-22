@@ -1,169 +1,183 @@
-#!/usr/bin/env python3
 """
-Tally-only performance test: encrypt ONE vote, inject it N times directly
-into the backend ballot store (no proof generation or server-side verification),
-then trigger tally to measure aggregation + threshold decryption time.
+On-chain tally performance smoke test.
+
+Intent: time `tally_aggregator.aggregate()` and `tally_aggregator.finalize()` on a
+moderate number of ballots and ensure correctness. We do not enforce strict
+time budgets in CI; we simply surface timings.
 """
 
-import random
+from __future__ import annotations
+
+import logging
+import os
+import socket
+import sys
 import threading
 import time
-import sys
-import os
-import logging
+
+import pytest
 import requests
 
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from keyper import create_keyper_app
-from backend import create_backend_app
-from bulletin_board import create_bb_app
-from crypto.primitives import point_to_dict, dict_to_point
-from crypto.elgamal import encrypt
+from eth_account import Account  # noqa: E402
+from chain_setup import (  # noqa: E402
+    ANVIL_KEYS,
+    anvil_address,
+    deploy_keyper_set,
+    deploy_registry,
+    publish_election,
+    start_anvil,
+    stop_anvil,
+)
+from eth_client import ElectionClient, EthChain  # noqa: E402
+from keyper import create_keyper_app  # noqa: E402
+from vote_proxy import create_vote_proxy_app  # noqa: E402
+from voter import cast_vote_via_proxy  # noqa: E402
+from wr_oracle import create_wr_oracle_app  # noqa: E402
+from sdk_compat import schnorr_keygen  # noqa: E402
+from crypto.primitives import g1_to_compressed  # noqa: E402
+import tally_aggregator  # noqa: E402
 
-NUM_CANDIDATES = 10
-BUDGET = 10
-NUM_VOTES = 10000
-N_KEYPERS = 3
-THRESHOLD = 1
 
-BACKEND_PORT = 9500
-KEYPER_BASE_PORT = 9501
-BB_PORT = 9599
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
-def start_flask(app, port):
+def _serve(app, port: int, host: str = "127.0.0.1") -> threading.Thread:
     t = threading.Thread(
-        target=lambda: app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False),
+        target=lambda: app.run(host=host, port=port, debug=False, use_reloader=False),
         daemon=True,
     )
     t.start()
     return t
 
 
-def wait_for(url, retries=40, delay=0.25):
+def _wait_http(url: str, retries: int = 80, delay: float = 0.05) -> None:
     for _ in range(retries):
         try:
-            requests.get(url, timeout=1)
-            return True
+            requests.get(url, timeout=0.5)
+            return
         except requests.exceptions.ConnectionError:
             time.sleep(delay)
-    return False
+    raise TimeoutError(f"server at {url} never came up")
 
 
-def main():
-    random.seed(42)
-    backend_url = f"http://127.0.0.1:{BACKEND_PORT}"
-    bb_url = f"http://127.0.0.1:{BB_PORT}"
-
-    # --- Start servers ---
-    print(f"Starting {N_KEYPERS} keypers, bulletin board, and backend...", flush=True)
-    bb_app = create_bb_app()
-    start_flask(bb_app, BB_PORT)
-
-    keyper_urls = []
-    for i in range(N_KEYPERS):
-        port = KEYPER_BASE_PORT + i
-        app = create_keyper_app(i + 1)
-        start_flask(app, port)
-        keyper_urls.append(f"http://127.0.0.1:{port}")
-
-    backend_app = create_backend_app(keyper_urls, bb_url)
-    start_flask(backend_app, BACKEND_PORT)
-
-    assert wait_for(f"{bb_url}/bb/status"), "Bulletin board not ready"
+def _run_dkg(*, keyper_urls: list[str], keyper_addrs: list[str], election_id: str, election_address: str) -> None:
+    url_map = {str(i + 1): keyper_urls[i] for i in range(3)}
+    for kid, url in zip([1, 2, 3], keyper_urls):
+        assert requests.post(
+            f"{url}/dkg/round1",
+            json={"n": 3, "t": 1, "keyper_id": kid, "election_id": election_id, "members": keyper_addrs},
+            timeout=20,
+        ).json().get("status") == "ok"
     for url in keyper_urls:
-        assert wait_for(f"{url}/status"), f"Keyper {url} not ready"
-    assert wait_for(f"{backend_url}/election/status"), "Backend not ready"
-    print("All servers ready.", flush=True)
-
-    # --- Create election ---
-    candidate_names = [f"Candidate_{i}" for i in range(NUM_CANDIDATES)]
-    resp = requests.post(f"{backend_url}/election/create", json={
-        "n": N_KEYPERS, "t": THRESHOLD,
-        "num_candidates": NUM_CANDIDATES, "budget": BUDGET,
-        "candidate_names": candidate_names,
-    }, timeout=30)
-    assert resp.status_code == 200, f"Create failed: {resp.text}"
-    print(f"Election created: {NUM_CANDIDATES} candidates, B={BUDGET}", flush=True)
-
-    # --- DKG ---
-    print("Running DKG...", end=" ", flush=True)
-    t0 = time.time()
-    resp = requests.post(f"{backend_url}/election/dkg", timeout=300)
-    assert resp.status_code == 200, f"DKG failed: {resp.text}"
-    print(f"done in {time.time()-t0:.1f}s", flush=True)
-
-    # Fetch params
-    params = requests.get(f"{backend_url}/election/params", timeout=5).json()
-    mpk = dict_to_point(params["mpk"])
-
-    # --- Encrypt ONE vote (no proofs needed) ---
-    vote_vector = [0] * NUM_CANDIDATES
-    for _ in range(BUDGET):
-        vote_vector[random.randint(0, NUM_CANDIDATES - 1)] += 1
-    print(f"Vote vector: {vote_vector} (sum={sum(vote_vector)})", flush=True)
-
-    print("Encrypting one vote...", end=" ", flush=True)
-    t0 = time.time()
-    ciphertexts = []
-    for v in vote_vector:
-        C1, C2, _r = encrypt(mpk, v)
-        ciphertexts.append((C1, C2))
-    enc_time = time.time() - t0
-    print(f"done in {enc_time:.1f}s", flush=True)
-
-    # --- Inject ballots directly into backend state (skip verification) ---
-    state = backend_app._election_state
-
-    print(f"Injecting {NUM_VOTES} identical ballots into backend state...", end=" ", flush=True)
-    t0 = time.time()
-    with state["lock"]:
-        for i in range(NUM_VOTES):
-            state["ballots"].append(list(ciphertexts))
-    inject_time = time.time() - t0
-    print(f"done in {inject_time:.3f}s ({len(state['ballots'])} ballots stored)", flush=True)
-
-    # Expected tally
-    expected_tally = [v * NUM_VOTES for v in vote_vector]
-    print(f"Expected tally: {expected_tally}", flush=True)
-
-    # --- Tally ---
-    print(f"\nRunning tally ({NUM_VOTES} ballots × {NUM_CANDIDATES} candidates)...", flush=True)
-    t0 = time.time()
-    resp = requests.post(f"{backend_url}/election/tally", timeout=1800)
-    tally_time = time.time() - t0
-    assert resp.status_code == 200, f"Tally failed: {resp.text}"
-    results = resp.json()["results"]
-    print(f"Tally done in {tally_time:.1f}s", flush=True)
-
-    # --- Verify ---
-    print(f"\n{'Candidate':<15} {'Expected':>8} {'Got':>8} {'Match':>6}")
-    print("-" * 40)
-    all_match = True
-    for j in range(NUM_CANDIDATES):
-        name = candidate_names[j]
-        exp = expected_tally[j]
-        got = results[name]
-        ok = "OK" if got == exp else "FAIL"
-        if got != exp:
-            all_match = False
-        print(f"{name:<15} {exp:>8} {got:>8} {ok:>6}")
-
-    print("-" * 40)
-    print(f"\nTimings:")
-    print(f"  Encryption (1 vote, {NUM_CANDIDATES} candidates): {enc_time:.1f}s")
-    print(f"  Ballot injection ({NUM_VOTES} votes):       {inject_time:.3f}s")
-    print(f"  Tally + decryption:                  {tally_time:.1f}s")
-
-    if all_match:
-        print(f"\nALL CORRECT — {NUM_VOTES} ballots, {NUM_CANDIDATES} candidates, B={BUDGET}")
-    else:
-        print("\nMISMATCH DETECTED!")
-        sys.exit(1)
+        assert requests.post(f"{url}/dkg/distribute_commitments", json={"keyper_urls": url_map}, timeout=30).json().get("status") == "ok"
+    for url in keyper_urls:
+        assert requests.post(f"{url}/dkg/distribute_shares", json={"keyper_urls": url_map}, timeout=30).json().get("status") == "ok"
+    for url in keyper_urls:
+        assert requests.post(f"{url}/dkg/round2", json={"election_id": election_id}, timeout=30).json().get("verified")
+    for url in keyper_urls:
+        r = requests.post(f"{url}/dkg/publish_on_chain", json={"election_address": election_address, "n": 3}, timeout=30).json()
+        assert "error" not in r, r
 
 
-if __name__ == "__main__":
-    main()
+@pytest.mark.parametrize(
+    ("num_votes", "num_candidates"),
+    [
+        (25, 3),
+        (25, 5),
+    ],
+)
+def test_onchain_tally_perf_smoke(num_votes: int, num_candidates: int) -> None:
+    anvil = start_anvil(port=_free_port(), log_path="/tmp/anvil-tally-perf.log")
+    try:
+        admin_key = ANVIL_KEYS[0]
+        tally_key = ANVIL_KEYS[1]
+        proxy_key = ANVIL_KEYS[2]
+        keyper_keys = list(ANVIL_KEYS[3:6])
+        keyper_addrs = [anvil_address(k) for k in keyper_keys]
+
+        chain = EthChain.connect(anvil.rpc_url, private_key=admin_key)
+        ks = deploy_keyper_set(rpc_url=anvil.rpc_url, deployer_key=admin_key, members=keyper_addrs, threshold=2)
+        reg = deploy_registry(rpc_url=anvil.rpc_url, deployer_key=admin_key, admin=anvil_address(admin_key))
+
+        wr_sk_int = int.from_bytes(b"WR-perf" + b"\x00" * 25, "big") + 1
+        _, wr_vk = schnorr_keygen(wr_sk_int)
+        wr_pk = g1_to_compressed(wr_vk)
+        wr_port = _free_port()
+        _serve(create_wr_oracle_app(private_key=wr_sk_int), wr_port)
+        wr_url = f"http://127.0.0.1:{wr_port}"
+        _wait_http(f"{wr_url}/status")
+
+        now = int(chain.w3.eth.get_block("latest")["timestamp"])
+        voting_end = now + 25
+        election_address = publish_election(
+            chain=chain,
+            registry_address=reg,
+            keyper_set_address=ks,
+            voting_start=now - 60,
+            voting_end=voting_end,
+            num_candidates=num_candidates,
+            budget=1,
+            self_submit_fee=0,
+            pk_wr=wr_pk,
+            tally_aggregator=anvil_address(tally_key),
+            vote_proxy=anvil_address(proxy_key),
+        )
+        election = ElectionClient(chain, election_address)
+
+        keyper_ports = [_free_port(), _free_port(), _free_port()]
+        keyper_urls = [f"http://127.0.0.1:{p}" for p in keyper_ports]
+        for kid, port, key in zip([1, 2, 3], keyper_ports, keyper_keys):
+            _serve(create_keyper_app(kid, chain_config={"rpc_url": anvil.rpc_url, "private_key": key}), port)
+        proxy_port = _free_port()
+        proxy_url = f"http://127.0.0.1:{proxy_port}"
+        _serve(create_vote_proxy_app(rpc_url=anvil.rpc_url, private_key=proxy_key, default_election_address=election_address), proxy_port)
+        for url in keyper_urls:
+            _wait_http(f"{url}/status")
+        _wait_http(f"{proxy_url}/status")
+
+        eid = f"perf-{election_address[2:10]}"
+        _run_dkg(keyper_urls=keyper_urls, keyper_addrs=keyper_addrs, election_id=eid, election_address=election_address)
+        assert election.is_dkg_finalized()
+
+        expected = [0] * num_candidates
+        # Deterministic pattern: cycle through candidates.
+        for i in range(num_votes):
+            c = i % num_candidates
+            vec = [0] * num_candidates
+            vec[c] = 1
+            expected[c] += 1
+            assert cast_vote_via_proxy(proxy_url, anvil.rpc_url, election_address, vec, wr_url=wr_url)
+
+        chain.w3.provider.make_request("anvil_setNextBlockTimestamp", [voting_end + 1])
+        chain.w3.provider.make_request("anvil_mine", [1])
+
+        signer = Account.from_key(tally_key)
+        t0 = time.perf_counter()
+        tally_aggregator.aggregate(chain, election_address, signer)
+        t_agg = time.perf_counter() - t0
+
+        for url in keyper_urls:
+            r = requests.post(f"{url}/decrypt/publish_on_chain", json={"election_address": election_address}, timeout=60).json()
+            assert "error" not in r, r
+
+        t1 = time.perf_counter()
+        fin = tally_aggregator.finalize(chain, election_address, signer)
+        t_fin = time.perf_counter() - t1
+
+        assert fin.totals == expected
+        assert election.get_result()["tally"] == expected
+
+        # Print timings for operator visibility (pytest will capture unless -s).
+        print(
+            f"aggregate_seconds={t_agg:.3f} finalize_seconds={t_fin:.3f} "
+            f"ballots={num_votes} candidates={num_candidates}"
+        )
+    finally:
+        stop_anvil(anvil)
