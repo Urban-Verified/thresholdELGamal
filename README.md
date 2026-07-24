@@ -79,6 +79,15 @@ pip install -r requirements.txt
 
 For the full on-chain end-to-end runbook, see `RUNNING.md` §3.
 
+### Multi-operator deployment
+
+For a real deployment — independently-operated keypers, each holding only
+their own key, talking over a network with bearer-token auth and
+encrypted persisted state — see `docker/README.md` and `RUNNING.md` §3c.
+`docker-compose.keyper.yml` runs one keyper; `docker-compose.coordinator.yml`
+runs `dkg-coordinator` (bootstraps tokens, drives DKG) and `tally-aggregator`
+(publishes the aggregate, triggers keyper decryption, finalizes the result).
+
 ### Interactive TUI (recommended)
 
 The admin TUI can launch all servers, create elections, run DKG, monitor ballots, and tally — all from one terminal:
@@ -144,6 +153,9 @@ src/
 │   ├── test_stress.py         # On-chain stress smoke tests
 │   └── test_tally_perf.py     # On-chain perf smoke tests
 ├── keyper.py              # Keyper server (Flask) with signed P2P DKG (commitments + shares)
+├── keyper_persistence.py  # Fernet-encrypted DKG secret / bootstrap-token persistence
+├── token_bootstrap.py     # X25519 seal/unseal + EIP-191 payload hashing for /auth/bootstrap
+├── coordinator_state.py   # Plaintext bootstrap_tokens.json hand-off (dkg-coordinator -> tally-aggregator)
 ├── voter.py               # Voter CLI
 ├── admin_tui.py           # Admin TUI with server management (rich)
 ├── dkg_coordinator.py     # Orchestrates keyper DKG HTTP APIs + publishes on-chain
@@ -154,14 +166,25 @@ src/
 ├── eth_client.py          # web3.py wrappers for KeyperSet / Registry / Election
 ├── sdk_compat.py          # Python port of the shutter-voting-sdk subset we need
 └── requirements.txt
+
+docker-compose.keyper.yml         # Multi-operator: one independently-run keyper
+docker-compose.coordinator.yml    # Multi-operator: dkg-coordinator + tally-aggregator
 ```
 
 ## API Reference
 
-### Keyper (P2P endpoints)
+### Keyper endpoints
+
+Every endpoint below requires a bearer token once the keyper is started
+with `COORDINATOR_ADDRESS` set (multi-operator mode — see "Multi-operator
+deployment" below) — except `/status`, `/health`, and `/auth/bootstrap`,
+which must stay reachable before any token exists to check against.
 
 | Endpoint | Method | Description |
 |---|---|---|
+| `/status` | GET | Identity, encryption pubkey (+ signature), `bootstrapped`/`dkg_completed` flags |
+| `/health` | GET | Liveness probe (uptime, DKG-in-progress flag) |
+| `/auth/bootstrap` | POST | Coordinator-pushed bearer-token install (X25519 sealed box + EIP-191 signed) |
 | `/dkg/round1` | POST | Generate polynomial + commitments + shares; pin election context |
 | `/dkg/distribute_commitments` | POST | Fan out signed commitments to other keypers |
 | `/dkg/receive_commitments` | POST | Append-only, signature-verified intake from a peer |
@@ -190,6 +213,13 @@ src/
 - Domain separation across proof types
 - Budget proof Fiat-Shamir transcript binds P₂ and mpk per protocol spec
 - Optional election ID binding in proofs
+- Multi-operator keyper authentication (two-tier bearer tokens minted and
+  pushed by `dkg-coordinator` over an X25519 sealed box, EIP-191 signed
+  against a keyper's own configured `COORDINATOR_ADDRESS`; no unauthenticated
+  route accepts caller-supplied peer addresses)
+- Encrypted-at-rest keyper state (DKG secret, bootstrap tokens, bootstrap
+  encryption keypair — Fernet, key derived from the keyper's own signing
+  key) so a restart never needs a fresh DKG ceremony or re-bootstrap
 
 **Not implemented (requires deployment context):**
 - Voter authentication (OIDC / Keycloak)

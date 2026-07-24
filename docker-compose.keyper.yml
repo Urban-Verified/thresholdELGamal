@@ -1,0 +1,81 @@
+# Keyper operator stack — one independently-operated committee member.
+#
+# Run this on your own machine/droplet. You hold only your own private
+# key; the chain RPC, the deployed Election contract, and the other
+# keypers are all external to this stack.
+#
+# Required .env on this machine:
+#   KEYPER_PRIVATE_KEY    Your keyper's Ethereum private key (keep secret).
+#                         Its address must already be registered as a
+#                         member of the on-chain KeyperSet for this election.
+#   RPC_URL               Chain RPC URL this keyper publishes DKG/decryption
+#                         transactions through.
+#
+# Optional .env:
+#   KEYPER_ID             Keyper ID assigned by the election administrator
+#                         (1-indexed, matches your position in the
+#                         KeyperSet). Default: 1.
+#   KEYPER_PORT           Port to listen on and publish to the host. Default: 5001.
+#   COORDINATOR_ADDRESS    The election administrator's coordinator address
+#                         (public, non-secret -- get it from them once, out
+#                         of band). Empty = single-operator dev mode (no
+#                         auth enforced on this keyper's endpoints -- do not
+#                         use in production).
+#   KEYPER_STATE_DIR_HOST Host-side bind-mount path for encrypted state
+#                         (default: ./keyper-state). Only matters if you're
+#                         running more than one instance of this compose
+#                         file on the same machine (e.g. local
+#                         multi-operator testing via `docker compose -p
+#                         keyper2 ...`) -- give each instance its own path,
+#                         or they'll silently overwrite each other's state.
+#
+# Quick start:
+#   cp .env.keyper.example .env
+#   mkdir -p keyper-state
+#   docker compose -f docker-compose.keyper.yml up -d --build
+#
+# Operator onboarding (one-time):
+#   1. Set COORDINATOR_ADDRESS in .env (given to you by the election administrator)
+#   2. Share your public URL with the election administrator
+#   3. Start the service
+# No token to generate or share -- the administrator's dkg-coordinator
+# mints your bearer tokens and pushes them automatically over an
+# encrypted, signed channel once it can reach your /status endpoint.
+
+services:
+  keyper:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: threshold-elgamal-app
+    command:
+      - python
+      - keyper.py
+      - --id
+      - "${KEYPER_ID:-1}"
+      - --port
+      - "${KEYPER_PORT:-5001}"
+      - --host
+      - "0.0.0.0"
+      - --rpc-url
+      - "${RPC_URL}"
+    environment:
+      KEYPER_PRIVATE_KEY: ${KEYPER_PRIVATE_KEY}
+      COORDINATOR_ADDRESS: ${COORDINATOR_ADDRESS:-}
+      KEYPER_STATE_DIR: /keyper-state
+    ports:
+      - "${KEYPER_PORT:-5001}:${KEYPER_PORT:-5001}"
+    volumes:
+      - ${KEYPER_STATE_DIR_HOST:-./keyper-state}:/keyper-state
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:${KEYPER_PORT:-5001}/health')"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped

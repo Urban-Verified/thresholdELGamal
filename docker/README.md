@@ -1,179 +1,215 @@
-# Docker Compose — keypers + DKG coordinator + tally aggregator
+# Docker Compose — multi-operator deployment
 
-Spin up an arbitrary-sized keyper cluster, run DKG end-to-end, and
-poll-and-tally the result against any chain. The compose stack is
-intentionally scoped to a single election — bring your own RPC, your
-own deployed `Election` contract, and your own WR oracle / vote proxy
-(run those from `src/` on the host).
+Two independent stacks, matching the two real-world roles in a live
+election:
+
+- **`docker-compose.keyper.yml`** (project root) — one committee member.
+  Run by each keyper operator, on their own machine, holding only their
+  own private key.
+- **`docker-compose.coordinator.yml`** (project root) — `dkg-coordinator` +
+  `tally-aggregator`. Run once by the election administrator, who holds
+  the chain RPC, the deployed `Election` contract, and the public URLs of
+  every keyper operator.
+
+This directory (`docker/`) only holds the shared image build (`Dockerfile`)
+and the one-shot coordinator entry point (`dkg-runner.sh`) — the compose
+files themselves live at the project root, since that's where each
+operator actually runs `docker compose up` from.
+
+For a single-machine demo with no real multi-operator auth, use
+`admin_tui.py` instead (see `RUNNING.md` §3a) — it spins up all keypers
+in-process and drives the whole election via a menu. These compose files
+are for a *real* deployment: independently-operated keypers, each holding
+only their own key, talking over the network.
 
 ## Layout
 
 ```
 docker/
-├── Dockerfile             # builds the shared image (src/ + abis/ + dkg-runner)
-├── dkg-runner.sh          # entry point for the one-shot dkg-coordinator
-├── .env.example           # copy to .env and edit
-├── generate-compose.py    # renders docker-compose.yml from .env
-└── docker-compose.yml     # (generated — do not edit by hand)
+├── Dockerfile              # builds the shared image (src/ + abis/ + dkg-runner)
+├── dkg-runner.sh            # entry point for the one-shot dkg-coordinator
+└── README.md                # this file
+
+(project root)
+├── docker-compose.keyper.yml       # one keyper — run by each operator
+├── .env.keyper.example
+├── docker-compose.coordinator.yml  # dkg-coordinator + tally-aggregator — run once
+└── .env.coordinator.example
 ```
 
 ## What the services do
 
-- **`keyper-<i>`** — long-running Flask servers participating in DKG
-  and partial decryption. Each one listens internally on port 5000 and
-  is exposed on the host at `KEYPER_HOST_PORT_BASE + i`.
-- **`dkg-coordinator`** — one-shot. Waits for every keyper's `/status`,
-  checks `Election.isDKGFinalized()` on chain, and runs the full DKG
-  protocol (round1 → distribute commitments → distribute shares →
+- **`keyper`** (`docker-compose.keyper.yml`) — one Flask server
+  participating in DKG and partial decryption. Persists its DKG secret,
+  its bootstrap-installed bearer tokens, and its bootstrap X25519 keypair
+  to a Fernet-encrypted volume (`./keyper-state`, key derived from
+  `KEYPER_PRIVATE_KEY`), so a restart never needs a fresh DKG ceremony or
+  a fresh bootstrap.
+- **`dkg-coordinator`** (`docker-compose.coordinator.yml`) — one-shot.
+  First bootstraps every keyper's bearer tokens (mints an `api_token` +
+  `peer_token` pair per keyper, seals + signs them via each keyper's
+  `/auth/bootstrap`, and writes `./coordinator-state/bootstrap_tokens.json`
+  so `tally-aggregator` can use the same tokens later — see "Auth &
+  bootstrap" below). Then checks `Election.isDKGFinalized()` and runs the
+  DKG protocol (round1 → distribute commitments → distribute shares →
   round2 → publish on chain) if not already done. Re-running
-  `docker compose up` is safe: the on-chain check short-circuits it.
-- **`tally-aggregator`** — long-running daemon. Waits for `votingEnd`,
-  publishes the aggregate, waits for `thresholdT` decryption shares,
-  then publishes the result and exits.
+  `docker compose up` is safe: both steps are idempotent.
+- **`tally-aggregator`** (`docker-compose.coordinator.yml`) — long-running
+  daemon. Waits for `votingEnd`, publishes the aggregate, then reads
+  `./coordinator-state/bootstrap_tokens.json` and calls each keyper's
+  `/decrypt/publish_on_chain` directly (no manual step needed — see
+  "Auth & bootstrap"), waits for `thresholdT` decryption shares, publishes
+  the result, and exits.
 
-Casting votes and triggering keyper `decrypt/publish_on_chain` is still
-done from the host — see step 6 below.
+## Auth & bootstrap
+
+Every keyper endpoint except `/status`, `/health`, and `/auth/bootstrap`
+requires a bearer token once `COORDINATOR_ADDRESS` is set on that keyper
+(empty = single-operator dev mode, no auth enforced — never use this for
+a real multi-operator deployment). Two token tiers, mirroring sx-monorepo's
+design:
+
+- **`api_token`** — held by `dkg-coordinator` and reused as-is by
+  `tally-aggregator` (deliberately the *same* token, not a third type —
+  keeps operational surface small). Required on round1/round2/
+  distribute_*/publish_on_chain/decrypt/publish_on_chain.
+- **`peer_token`** — held by every keyper, used only for keyper-to-keyper
+  P2P calls (`/dkg/receive_commitments`, `/dkg/receive_share`).
+
+Tokens are minted once by `dkg-coordinator` (never rotated automatically)
+and pushed to each keyper over an anonymous X25519 sealed box, EIP-191
+signed by `COORDINATOR_SIGNING_KEY` so a keyper can verify the push really
+came from its configured `COORDINATOR_ADDRESS` — an unauthenticated
+`POST /auth/bootstrap` is unavoidable (it establishes the very
+credentials every other route checks), so authenticity comes entirely
+from that signature, not from the HTTP layer.
+
+`dkg-coordinator` also delivers each keyper's `peers` map (every *other*
+keyper's URL + P2P token) via this same bootstrap push. Keypers never
+accept a caller-supplied address book from an authenticated request body
+— `distribute_commitments`/`distribute_shares` always fan out to the
+bootstrap-installed `peers` map once auth is on, so a leaked `api_token`
+alone can't be used to redirect where a keyper's shares get sent.
+
+`tally-aggregator` needs the same `api_token`s much later — after
+`votingEnd`, to trigger decryption — but the two processes share no
+database and don't overlap in any guaranteed way. The fix:
+`dkg-coordinator` writes `./coordinator-state/bootstrap_tokens.json`
+(a Docker volume mounted at the project root, `{keyper_url:
+{api_token, peer_token}}`), and `tally-aggregator` reads it lazily —
+right when it's about to trigger decryption, not at daemon startup —
+retrying automatically on its own poll loop if the file isn't there yet.
+This file is **plaintext**, not Fernet-encrypted like keyper-side state:
+both processes are run by the same administering party that already
+holds `TALLY_AGGREGATOR_PRIVATE_KEY` and `COORDINATOR_SIGNING_KEY` in the
+same `.env`/filesystem trust boundary, so it adds no new secret exposure.
+
+Because `tally-aggregator` now triggers decryption automatically,
+`admin_tui.py`'s menu option **8 — "Keypers submit decryption shares
+(on-chain)"** is not needed in this deployment path; it remains useful
+only for the single-machine demo TUI, where nothing else triggers it.
 
 ## Prerequisites
 
-- Docker (with `docker compose` v2 — no separate `docker-compose` binary needed).
-- Python 3 on the host (only used to run `generate-compose.py`; preinstalled on standard Ubuntu/Debian/DigitalOcean droplet images).
+- Docker (with `docker compose` v2).
 - A reachable chain RPC and a deployed `Election` contract on that chain.
 - Per-keyper private keys whose addresses are already registered as
   members of the on-chain `KeyperSet` for this election.
 - A private key holding `TALLY_AGGREGATOR_ROLE` on the `Election`.
+- (Multi-operator auth) A `COORDINATOR_SIGNING_KEY` generated by the
+  election administrator; its address shared with every keyper operator
+  as their `COORDINATOR_ADDRESS`.
 
-## 1. Configure
-
-```sh
-cd docker
-cp .env.example .env
-```
-
-All knobs live in `.env`:
-
-| Variable | Meaning |
-|---|---|
-| `NUM_KEYPERS` | Committee size (e.g. `3`, `5`, `7`). |
-| `KEYPER_HOST_PORT_BASE` | Host port for keyper 1 is `base + 1`; keyper 2 is `base + 2`; … |
-| `RPC_URL` | Chain RPC URL. Use `http://host.docker.internal:8545` to reach a node on the docker host (works on Linux too via `extra_hosts`). |
-| `ELECTION_ADDRESS` | Address of the deployed `Election` contract for this run. |
-| `ELECTION_ID` | Opaque DKG scope string (any non-empty value, kept stable per election). |
-| `DKG_THRESHOLD` | Polynomial degree `t` — `t+1` shares are required to decrypt. Typical: `floor((NUM_KEYPERS - 1) / 2)`. |
-| `KEYPER_PRIVATE_KEY_<i>` | Per-keyper Ethereum key (also signs P2P DKG messages). Must match the i-th `KeyperSet` member address. |
-| `TALLY_AGGREGATOR_PRIVATE_KEY` | Key holding `TALLY_AGGREGATOR_ROLE` on the `Election`. |
-| `TALLY_POLL_SECONDS` | Tally daemon poll interval. |
-
-If you raise `NUM_KEYPERS` past 3, add the extra `KEYPER_PRIVATE_KEY_<i>`
-lines.
-
-## 2. Render the compose file
+## 1. Each keyper operator
 
 ```sh
-python3 generate-compose.py
+cp .env.keyper.example .env
+mkdir -p keyper-state
+docker compose -f docker-compose.keyper.yml up -d --build
 ```
 
-Writes `docker-compose.yml` with `keyper-1`..`keyper-N`, the one-shot
-`dkg-coordinator`, and the long-running `tally-aggregator`. Re-run any
-time you change `NUM_KEYPERS` or the port base in `.env`.
+Fill in `.env`: `KEYPER_PRIVATE_KEY`, `RPC_URL`, `KEYPER_ID`, `KEYPER_PORT`,
+and (once the administrator has generated one) `COORDINATOR_ADDRESS`.
+Share your public URL with the administrator during onboarding — no
+token to generate or exchange yourself.
 
-## 3. Bring the stack up
+Verify:
 
 ```sh
-docker compose up --build
+curl -s http://127.0.0.1:${KEYPER_PORT:-5001}/status | jq
 ```
 
-First boot builds the shared `threshold-elgamal-app` image; subsequent
-boots reuse it. Drop `--build` to skip the rebuild step.
+`address` should match your `KeyperSet` member entry; `bootstrapped`
+flips to `true` once the administrator's `dkg-coordinator` reaches you.
 
-To run detached:
+## 2. Election administrator
 
 ```sh
-docker compose up -d --build
-docker compose logs -f
+cp .env.coordinator.example .env
+mkdir -p coordinator-state
+docker compose -f docker-compose.coordinator.yml up --build
 ```
 
-## 4. Verify the services
+Fill in `.env`: `KEYPER_URLS` (every keyper operator's public URL, in
+`KeyperSet` member order), `NUM_KEYPERS`, `DKG_THRESHOLD`, `RPC_URL`,
+`ELECTION_ADDRESS`, `ELECTION_ID`, `COORDINATOR_SIGNING_KEY`,
+`TALLY_AGGREGATOR_PRIVATE_KEY`, `TALLY_POLL_SECONDS`.
 
-Each keyper exposes a `/status` endpoint on `KEYPER_HOST_PORT_BASE + i`
-(defaults to 5001, 5002, …):
+`dkg-coordinator` bootstraps tokens, runs DKG, and exits 0. Watch it:
 
 ```sh
-curl -s http://127.0.0.1:5001/status | jq
-curl -s http://127.0.0.1:5002/status | jq
-curl -s http://127.0.0.1:5003/status | jq
+docker compose -f docker-compose.coordinator.yml logs -f dkg-coordinator
 ```
 
-The `address` field should match the keyper-set member at index `i-1`.
-
-## 5. DKG runs automatically
-
-The `dkg-coordinator` service comes up after the keypers, waits for
-their `/status` endpoints, and runs the full DKG protocol. Watch its
-logs:
+`tally-aggregator` keeps running, watching for `votingEnd`:
 
 ```sh
-docker compose logs -f dkg-coordinator
+docker compose -f docker-compose.coordinator.yml logs -f tally-aggregator
 ```
 
-It exits with code 0 as soon as the DKG result is finalized on chain.
-Re-running `docker compose up` is safe — the service checks
-`Election.isDKGFinalized()` first and short-circuits.
+## 3. Cast votes
 
-To drive DKG manually instead (e.g. from the admin TUI on the host),
-ignore the service and run the curl recipe from `RUNNING.md` §3b
-against the host-exposed keyper ports.
+Still done from the host / voter tooling directly against the deployed
+`Election` contract — see `RUNNING.md` §3b.
 
-## 6. Cast votes and trigger decryption
-
-Vote casting is done from the host — see `RUNNING.md` §3b for the full
-curl recipe. After voting ends, each keyper publishes its decryption
-share:
+## 4. Tear down
 
 ```sh
-for kid in 1 2 3; do
-  curl -X POST http://127.0.0.1:500$kid/decrypt/publish_on_chain \
-    -H "Content-Type: application/json" \
-    -d "{\"election_address\":\"$ELECTION_ADDRESS\"}"
-done
+docker compose -f docker-compose.keyper.yml down      # each keyper operator
+docker compose -f docker-compose.coordinator.yml down  # the administrator
 ```
 
-The `tally-aggregator` daemon picks up the aggregate publish and the
-decryption shares automatically — watch its logs:
+## Local multi-keyper testing on one machine
+
+Run `docker-compose.keyper.yml` more than once with different project
+names, ports, and state directories:
 
 ```sh
-docker compose logs -f tally-aggregator
+KEYPER_ID=1 KEYPER_PORT=5001 KEYPER_STATE_DIR_HOST=./keyper-state-1 \
+  docker compose -p keyper1 -f docker-compose.keyper.yml up -d
+KEYPER_ID=2 KEYPER_PORT=5002 KEYPER_STATE_DIR_HOST=./keyper-state-2 \
+  docker compose -p keyper2 -f docker-compose.keyper.yml up -d
+KEYPER_ID=3 KEYPER_PORT=5003 KEYPER_STATE_DIR_HOST=./keyper-state-3 \
+  docker compose -p keyper3 -f docker-compose.keyper.yml up -d
 ```
 
-## 7. Tear down
-
-```sh
-docker compose down
-```
-
-Add `-v` if you ever introduce named volumes you want wiped.
-
-## Common changes
-
-| Change | Action |
-|---|---|
-| Add/remove keypers | Edit `NUM_KEYPERS` (and add `KEYPER_PRIVATE_KEY_<i>` entries) → re-run `generate-compose.py` → `docker compose up`. |
-| Move to a new chain | Edit `RPC_URL` and `ELECTION_ADDRESS` → `docker compose up` (no regenerate needed — these are read at container start). |
-| Change exposed ports | Edit `KEYPER_HOST_PORT_BASE` → re-run `generate-compose.py`. |
-| Rotate keyper keys | Edit `KEYPER_PRIVATE_KEY_<i>` → `docker compose up` (the new key is read at container start). Make sure the new address is registered in the on-chain `KeyperSet`. |
+Then point `docker-compose.coordinator.yml`'s `KEYPER_URLS` at
+`http://host.docker.internal:5001,...:5002,...:5003`.
 
 ## Troubleshooting
 
-- **`error: .env not found`** — run `cp .env.example .env` first.
-- **`error: KEYPER_PRIVATE_KEY_<i> missing`** — add the missing key for
-  every `i` in `1..NUM_KEYPERS`.
+- **Keyper stuck `bootstrapped: false`** — check `dkg-coordinator`'s logs;
+  it needs to reach that keyper's `/status` over the network. Confirm the
+  keyper's public URL is correct in the administrator's `KEYPER_URLS`.
+- **`Unauthorized` from a keyper endpoint** — either `COORDINATOR_ADDRESS`
+  is set on the keyper but it was never successfully bootstrapped (check
+  `/status.bootstrapped`), or `COORDINATOR_SIGNING_KEY` doesn't match the
+  address the keyper expects.
 - **`ConnectionError` to RPC** — if your chain runs on the docker host,
-  use `http://host.docker.internal:8545` (works on Linux too because
-  the compose file wires `host.docker.internal` to the host gateway).
-- **Keyper signature errors during DKG** — the address derived from
-  `KEYPER_PRIVATE_KEY_<i>` does not match the i-th `KeyperSet` member.
-  Check `curl /status` on each keyper and compare against the on-chain
-  set.
+  use `http://host.docker.internal:8545` (both compose files wire the
+  alias on Linux too).
 - **Tally daemon loops with "DKG not finalized"** — expected until
-  enough keypers have called `/dkg/publish_on_chain` to cross the
-  threshold.
+  `dkg-coordinator` (or a manual run) crosses the on-chain threshold.
+- **Tally daemon loops with "shares on chain 0/N"** — check
+  `tally-aggregator`'s logs for `decrypt trigger failed at <url>`; a
+  keyper may be unreachable or still missing its bootstrap token.

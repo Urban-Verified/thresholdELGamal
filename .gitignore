@@ -42,3 +42,12 @@ test_logs/
 # Distribution
 *.whl
 *.tar.gz
+
+# Multi-operator keyper/coordinator persisted state
+keyper-state/
+coordinator-state/
+
+# Real per-deployment secrets copied from .env.keyper.example / .env.coordinator.example
+.env
+.env.keyper
+.env.coordinator

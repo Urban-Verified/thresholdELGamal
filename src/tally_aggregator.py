@@ -53,9 +53,11 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+import requests
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 
+import coordinator_state
 import sdk_compat
 from crypto.elgamal import threshold_decrypt
 from crypto.primitives import (
@@ -325,6 +327,55 @@ def _aggregate_published(election: ElectionClient) -> bool:
         return False
 
 
+def _keyper_urls_from_env() -> list[str]:
+    raw = os.environ.get("KEYPER_URLS", "")
+    return [u.strip().rstrip("/") for u in raw.split(",") if u.strip()]
+
+
+def _trigger_keyper_decrypts(election_address: str, *, quiet: bool = False) -> None:
+    """Best-effort trigger of each keyper's /decrypt/publish_on_chain.
+
+    Reads the coordinator-tier bearer tokens lazily, right here at the
+    point of use -- never at daemon startup. dkg-coordinator's one-shot
+    bootstrap pass writes the shared token file early in the election, but
+    there's no explicit start-order dependency between the two containers,
+    so this process must not assume the file exists yet when it boots. By
+    the time votingEnd has passed and the aggregate is published, the file
+    will have long since been written in virtually every real run; if it's
+    still missing (or a keyper has no entry in it -- single-operator dev
+    mode, where bootstrapping never runs at all), the request is simply
+    sent with no Authorization header, which keyper.py accepts as long as
+    it isn't itself configured to require auth. A failed or unauthorized
+    call here is not fatal -- daemon()'s own poll loop is the retry
+    mechanism, since this is only ever called while still waiting for the
+    share threshold.
+
+    Idempotent on the keyper side (a keyper that already submitted returns
+    a structured "skipped" response, not an error), so re-triggering every
+    poll cycle is safe and self-heals a keyper that was briefly down.
+    """
+    keyper_urls = _keyper_urls_from_env()
+    if not keyper_urls:
+        if not quiet:
+            print("[daemon] KEYPER_URLS not set -- cannot trigger keyper decrypt", file=sys.stderr)
+        return
+
+    tokens = coordinator_state.load_tokens()
+    for url in keyper_urls:
+        api_token = tokens.get(url, {}).get("api_token", "")
+        headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
+        try:
+            r = requests.post(f"{url}/decrypt/publish_on_chain",
+                               json={"election_address": election_address},
+                               headers=headers, timeout=30)
+            r.raise_for_status()
+            if not quiet:
+                print(f"[daemon] triggered decrypt at {url}: {r.json()}")
+        except Exception as e:
+            if not quiet:
+                print(f"[daemon] decrypt trigger failed at {url}: {e}", file=sys.stderr)
+
+
 def daemon(
     chain: EthChain,
     election_address: str,
@@ -382,6 +433,7 @@ def daemon(
             threshold = int(info["config"]["thresholdT"])
             shares = election.get_decryption_shares()
             if len(shares) < threshold:
+                _trigger_keyper_decrypts(election_address, quiet=quiet)
                 if not quiet:
                     print(f"[daemon] waiting: shares on chain {len(shares)}/{threshold}")
                 time.sleep(poll)
@@ -417,6 +469,9 @@ def daemon(
 # ---------------------------------------------------------------------------
 
 PRIVATE_KEY_ENV = "TALLY_AGGREGATOR_PRIVATE_KEY"
+RPC_URL_ENV = "RPC_URL"
+ELECTION_ADDRESS_ENV = "ELECTION_ADDRESS"
+POLL_SECONDS_ENV = "TALLY_POLL_SECONDS"
 
 
 def _resolve_signer(args) -> LocalAccount:
@@ -428,9 +483,25 @@ def _resolve_signer(args) -> LocalAccount:
     return Account.from_key(pk)
 
 
+def _resolve_rpc_url(args) -> str:
+    rpc_url = args.rpc_url or os.environ.get(RPC_URL_ENV)
+    if not rpc_url:
+        raise SystemExit(f"RPC URL required: pass --rpc-url or set ${RPC_URL_ENV}")
+    return rpc_url
+
+
+def _resolve_election(args) -> str:
+    election = args.election or os.environ.get(ELECTION_ADDRESS_ENV)
+    if not election:
+        raise SystemExit(f"election address required: pass --election or set ${ELECTION_ADDRESS_ENV}")
+    return election
+
+
 def _add_common_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--rpc-url", required=True, help="Ethereum RPC URL")
-    p.add_argument("--election", required=True, help="Election contract address")
+    p.add_argument("--rpc-url", default=None,
+                   help=f"Ethereum RPC URL. Prefer ${RPC_URL_ENV}.")
+    p.add_argument("--election", default=None,
+                   help=f"Election contract address. Prefer ${ELECTION_ADDRESS_ENV}.")
     p.add_argument("--private-key", default=None,
                    help=f"Hex private key (TALLY_AGGREGATOR_ROLE). "
                         f"Prefer ${PRIVATE_KEY_ENV}.")
@@ -442,10 +513,12 @@ def _print_result(result_obj) -> None:
 
 def _cmd_aggregate(args) -> int:
     signer = _resolve_signer(args)
-    chain = EthChain.connect(args.rpc_url, private_key=args.private_key
+    rpc_url = _resolve_rpc_url(args)
+    election = _resolve_election(args)
+    chain = EthChain.connect(rpc_url, private_key=args.private_key
                              or os.environ.get(PRIVATE_KEY_ENV))
     try:
-        res = aggregate(chain, args.election, signer)
+        res = aggregate(chain, election, signer)
     except TallyAggregatorError as e:
         print(f"aggregate failed: {e}", file=sys.stderr)
         if e.data:
@@ -457,10 +530,12 @@ def _cmd_aggregate(args) -> int:
 
 def _cmd_finalize(args) -> int:
     signer = _resolve_signer(args)
-    chain = EthChain.connect(args.rpc_url, private_key=args.private_key
+    rpc_url = _resolve_rpc_url(args)
+    election = _resolve_election(args)
+    chain = EthChain.connect(rpc_url, private_key=args.private_key
                              or os.environ.get(PRIVATE_KEY_ENV))
     try:
-        res = finalize(chain, args.election, signer)
+        res = finalize(chain, election, signer)
     except TallyAggregatorError as e:
         print(f"finalize failed: {e}", file=sys.stderr)
         if e.data:
@@ -472,13 +547,16 @@ def _cmd_finalize(args) -> int:
 
 def _cmd_daemon(args) -> int:
     signer = _resolve_signer(args)
-    chain = EthChain.connect(args.rpc_url, private_key=args.private_key
+    rpc_url = _resolve_rpc_url(args)
+    election = _resolve_election(args)
+    poll = args.poll if args.poll is not None else float(os.environ.get(POLL_SECONDS_ENV, "10"))
+    chain = EthChain.connect(rpc_url, private_key=args.private_key
                              or os.environ.get(PRIVATE_KEY_ENV))
     return daemon(
         chain,
-        args.election,
+        election,
         signer,
-        poll=args.poll,
+        poll=poll,
         quiet=args.quiet,
     )
 
@@ -499,8 +577,8 @@ def main():
 
     p_daemon = sub.add_parser("daemon", help="Watch chain and finalize automatically")
     _add_common_args(p_daemon)
-    p_daemon.add_argument("--poll", type=float, default=10.0,
-                          help="Seconds between polls (default 10)")
+    p_daemon.add_argument("--poll", type=float, default=None,
+                          help=f"Seconds between polls (default 10). Prefer ${POLL_SECONDS_ENV}.")
     p_daemon.add_argument("--quiet", action="store_true",
                           help="Reduce log output (errors still printed)")
     p_daemon.set_defaults(func=_cmd_daemon)

@@ -1,0 +1,74 @@
+# Election-administrator stack — dkg-coordinator + tally-aggregator.
+#
+# Run this once per election, from the machine that administers it. Bring
+# your own RPC, your own deployed Election contract, and the public URLs
+# of every independently-operated keyper (see docker-compose.keyper.yml,
+# run separately by each keyper operator).
+#
+# What the services do:
+#   dkg-coordinator   one-shot. Bootstraps keyper bearer tokens (mints and
+#                     pushes them via each keyper's /auth/bootstrap, then
+#                     writes ./coordinator-state/bootstrap_tokens.json so
+#                     tally-aggregator can use the same tokens later),
+#                     then checks Election.isDKGFinalized() and runs the
+#                     DKG ceremony across keypers if not already done.
+#                     Safe to re-run -- both steps are idempotent.
+#   tally-aggregator  long-running daemon. Waits for votingEnd, publishes
+#                     the aggregate, then reads the shared token file and
+#                     triggers each keyper's /decrypt/publish_on_chain,
+#                     waits for the share threshold, publishes the final
+#                     result, and exits.
+#
+# Casting votes is still done from the host / voter tooling directly
+# against the deployed Election contract -- see RUNNING.md.
+#
+# Quick start:
+#   cp .env.coordinator.example .env
+#   mkdir -p coordinator-state
+#   docker compose -f docker-compose.coordinator.yml up --build
+
+services:
+  dkg-coordinator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: threshold-elgamal-app
+    container_name: dkg-coordinator
+    environment:
+      KEYPER_URLS: ${KEYPER_URLS}
+      RPC_URL: ${RPC_URL}
+      ELECTION_ADDRESS: ${ELECTION_ADDRESS}
+      ELECTION_ID: ${ELECTION_ID}
+      NUM_KEYPERS: ${NUM_KEYPERS}
+      DKG_THRESHOLD: ${DKG_THRESHOLD}
+      # This administrator's own signing key -- mints and pushes bearer
+      # tokens to every keyper. Empty = single-operator dev mode (no
+      # bootstrap runs; every keyper must also have COORDINATOR_ADDRESS unset).
+      COORDINATOR_SIGNING_KEY: ${COORDINATOR_SIGNING_KEY:-}
+    command: ["dkg-runner"]
+    volumes:
+      - ./coordinator-state:/app/coordinator-state
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: "no"
+
+  tally-aggregator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: threshold-elgamal-app
+    container_name: tally-aggregator
+    environment:
+      TALLY_AGGREGATOR_PRIVATE_KEY: ${TALLY_AGGREGATOR_PRIVATE_KEY}
+      RPC_URL: ${RPC_URL}
+      ELECTION_ADDRESS: ${ELECTION_ADDRESS}
+      TALLY_POLL_SECONDS: ${TALLY_POLL_SECONDS:-10}
+      # Needed to trigger each keyper's /decrypt/publish_on_chain once
+      # voting ends and the aggregate is published.
+      KEYPER_URLS: ${KEYPER_URLS}
+    command: ["python", "tally_aggregator.py", "daemon"]
+    volumes:
+      - ./coordinator-state:/app/coordinator-state
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: on-failure
