@@ -9,9 +9,10 @@ Each keyper runs as an independent HTTP server and participates in:
 All operations use BLS12-381 G2.
 
 Usage:
-    python keyper.py --id 1 --port 5001
-    python keyper.py --id 2 --port 5002
-    python keyper.py --id 3 --port 5003
+    KEYPER_PRIVATE_KEY=0x... python keyper.py --port 5001
+
+A keyper's DKG index is resolved by the coordinator from the on-chain KeyperSet
+(matching this keyper's own signing address) and adopted at /dkg/round1 time.
 """
 
 import argparse
@@ -135,7 +136,7 @@ def _derive_fernet(private_key_hex: str) -> Fernet:
     return Fernet(key)
 
 
-def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
+def create_keyper_app(keyper_id=None, *, chain_config=None, signing_key=None):
     """Create a Flask app for a single keyper.
 
     ``chain_config`` is an optional dict ``{"rpc_url": str, "private_key": str}``
@@ -145,20 +146,39 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
     messages (commitments, shares, reveals). If omitted but
     ``chain_config`` is provided, the chain key doubles as the signing
     key. If neither is provided, a deterministic key is derived from
-    ``keyper_id`` so off-chain dev runs and tests still work.
+    ``keyper_id`` so off-chain dev runs and tests still work (this path
+    requires ``keyper_id`` -- the real deployment path always supplies a
+    real signing key instead).
+
+    ``keyper_id`` is optional and, for the real deployment path, normally
+    omitted entirely: a keyper's DKG index is not statically configured
+    -- it's resolved by the coordinator from the on-chain KeyperSet
+    (matching this keyper's own signing address) and adopted the first
+    time /dkg/round1 is called, or restored from persisted state on
+    restart. Passing an explicit ``keyper_id`` remains supported for
+    admin_tui.py's in-process demo and this package's own tests, which
+    already know their own index a priori from local, non-chain setup.
     """
     if signing_key is None:
         if chain_config is not None:
             signing_key = chain_config["private_key"]
-        else:
+        elif keyper_id is not None:
             # Deterministic dev fallback so off-chain test runs work
             # without explicit chain config.
             seed = hashlib.sha256(f"keyper-{keyper_id}".encode()).digest()
             signing_key = "0x" + seed.hex()
+        else:
+            raise ValueError(
+                "create_keyper_app requires signing_key, chain_config, or keyper_id "
+                "(the last only as a seed for the deterministic dev fallback key)"
+            )
     signing_address = Account.from_key(signing_key).address
-    logger = logging.getLogger(f'keyper.{keyper_id}')
+    # Persisted state is namespaced by this keyper's own signing address,
+    # not its (possibly still-unknown) DKG index -- see keyper_persistence.py.
+    identity = signing_address
+    logger = logging.getLogger(f'keyper.{signing_address[:10]}')
 
-    app = Flask(f"keyper_{keyper_id}")
+    app = Flask(f"keyper_{signing_address[:10]}")
     start_time = time.time()
 
     # This keyper's outbound address book -- {kid_str: {"url", "token"}} for
@@ -221,13 +241,13 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
         return {"Authorization": f"Bearer {tok}"} if tok else {}
 
     fernet = _derive_fernet(signing_key)
-    encryption_privkey = load_or_create_encryption_key(fernet, keyper_id, logger)
+    encryption_privkey = load_or_create_encryption_key(fernet, identity, logger)
     encryption_pubkey_bytes = encryption_privkey.public_key().public_bytes_raw()
     encryption_pubkey_hex = "0x" + encryption_pubkey_bytes.hex()
     encryption_pubkey_sig = _sign(signing_key, enc_pubkey_hash(encryption_pubkey_bytes))
     # Restore a prior bootstrap so a restart needs no re-push at all: no
     # rotation happens, tokens are minted once and persisted on both sides.
-    _persisted_tokens = load_bootstrap_tokens(fernet, keyper_id, logger)
+    _persisted_tokens = load_bootstrap_tokens(fernet, identity, logger)
     if _persisted_tokens:
         installed["api_token"] = _persisted_tokens.get("api_token")
         installed["peer_token"] = _persisted_tokens.get("peer_token")
@@ -235,6 +255,9 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
 
     dkg_state = KeyperDKGState()
     keyper_meta = {
+        # None until adopted from the coordinator's /dkg/round1 call (or
+        # restored below from a completed prior ceremony) -- see the
+        # module docstring and create_keyper_app's own docstring.
         "id": keyper_id,
         "chain_config": chain_config,
         "signing_key": signing_key,
@@ -244,13 +267,19 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
     # the KeyperSet, used to verify P2P signatures from that dealer. The
     # election_id scopes the signed payload to a specific DKG instance.
     dkg_meta = {"election_id": None, "members": []}
-    # Restore a completed DKG's combined share so a restart doesn't need a
-    # fresh ceremony -- see keyper_persistence.dkg_secret_file.
-    _persisted_dkg = load_dkg_secret(fernet, keyper_id, logger)
+    # Restore a completed DKG's combined share (and the index it was
+    # assigned) so a restart doesn't need a fresh ceremony -- see
+    # keyper_persistence.dkg_secret_file. Without restoring keyper_id
+    # here too, a restarted keyper would have keyper_meta["id"] = None
+    # forever (dkg-runner.sh skips round1 once DKG is already finalized
+    # on-chain, so there's no second chance to relearn it from the
+    # coordinator) and every subsequent decrypt-share submission would break.
+    _persisted_dkg = load_dkg_secret(fernet, identity, logger)
     if _persisted_dkg:
         dkg_state.combined_share = _persisted_dkg["share"]
         dkg_state.public_key_share = point_multiply(G2, _persisted_dkg["share"])
         dkg_meta["election_id"] = _persisted_dkg["election_id"]
+        keyper_meta["id"] = _persisted_dkg["keyper_id"]
     # Local share storage (P2P).
     pending_shares = {}            # generated by us in round1, indexed by recipient_id
     received_shares = {}           # received from other keypers, indexed by dealer_id
@@ -329,7 +358,7 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
             str(k): {"url": str(v["url"]), "token": str(v["token"])}
             for k, v in (payload.get("peers") or {}).items()
         })
-        save_bootstrap_tokens(fernet, keyper_id, installed["api_token"], installed["peer_token"], dict(peers))
+        save_bootstrap_tokens(fernet, identity, installed["api_token"], installed["peer_token"], dict(peers))
         logger.info("op=auth_bootstrap status=ok signer=%s", recovered)
         return jsonify({"status": "ok"})
 
@@ -350,8 +379,18 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
         election_id = data["election_id"]
         members = data.get("members", [])
 
-        if kid != keyper_meta["id"]:
+        # There is no statically-configured index to check against in the
+        # real deployment path (keyper_meta["id"] starts None) -- this
+        # keyper simply adopts whatever index the coordinator assigns,
+        # since the coordinator resolves it from the on-chain KeyperSet
+        # (KeyperSet.getMemberIndex against this keyper's own signing
+        # address) rather than from KEYPER_URLS list position. Callers
+        # that *do* pass an explicit keyper_id up front (admin_tui.py's
+        # in-process demo, this package's own tests) keep a real
+        # mismatch check -- a genuine misconfiguration there still fails loudly.
+        if keyper_meta["id"] is not None and kid != keyper_meta["id"]:
             return jsonify({"error": f"Keyper ID mismatch: configured as {keyper_meta['id']}, received {kid}"}), 400
+        keyper_meta["id"] = kid
         if not isinstance(members, list) or len(members) != n:
             return jsonify({"error": f"members must be a list of {n} addresses, got {len(members)}"}), 400
 
@@ -648,7 +687,7 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
         last_round2["active_dealers"] = sorted(received_shares.keys())
 
         # Persist so a restart doesn't need a fresh DKG ceremony.
-        save_dkg_secret(fernet, keyper_id, dkg_meta["election_id"], combined_share)
+        save_dkg_secret(fernet, identity, dkg_meta["election_id"], combined_share, keyper_meta["id"])
         logger.info("op=dkg_round2 election_id=%s status=verified", dkg_meta.get("election_id"))
 
         # Zeroize received shares after DKG completes.
@@ -882,7 +921,6 @@ def main():
         datefmt='%Y-%m-%dT%H:%M:%S',
     )
     parser = argparse.ArgumentParser(description="Keyper server for threshold ElGamal voting")
-    parser.add_argument("--id", type=int, required=True, help="Keyper ID (1-indexed)")
     parser.add_argument("--port", type=int, required=True, help="Port to listen on")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
     parser.add_argument("--rpc-url", default=None,
@@ -893,16 +931,20 @@ def main():
     args = parser.parse_args()
 
     private_key = args.private_key or os.environ.get("KEYPER_PRIVATE_KEY")
+    if not private_key:
+        sys.exit(
+            "Error: KEYPER_PRIVATE_KEY is required (or --private-key)."
+        )
     chain_config = None
-    if args.rpc_url and private_key:
+    if args.rpc_url:
         chain_config = {"rpc_url": args.rpc_url, "private_key": private_key}
 
     # Same key signs both the chain transactions and the P2P DKG messages
     # so the recovered address matches the KeyperSet member entry.
-    app = create_keyper_app(args.id, chain_config=chain_config, signing_key=private_key)
+    app = create_keyper_app(chain_config=chain_config, signing_key=private_key)
+    signing_address = Account.from_key(private_key).address
     suffix = " [chain enabled]" if chain_config else ""
-    print(f"[Keyper {args.id}] Starting on {args.host}:{args.port}{suffix}")
-    print(f"[Keyper {args.id}] Signing address: {Account.from_key(private_key).address if private_key else '(deterministic dev key)'}")
+    print(f"[Keyper {signing_address}] Starting on {args.host}:{args.port}{suffix}")
     app.run(host=args.host, port=args.port, debug=False, use_reloader=False)
 
 

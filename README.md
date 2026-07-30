@@ -113,26 +113,31 @@ then `q` to quit.
 ```bash
 cd src
 
-# Full test suite (78 unit/integration/e2e tests)
+# Pure crypto unit + integration tests (no chain, no Flask)
 python -m pytest tests/test_comprehensive.py -v
 
-# Standalone E2E tests (4 HTTP lifecycle tests)
-python -m pytest tests/test_e2e.py -v
+# On-chain e2e tests (anvil + forge required) -- full HTTP lifecycle
+# with signed P2P keyper DKG, on real Election/KeyperSet contracts
+python -m pytest tests/test_e2e_onchain.py -v
 
-# Stress test (100 votes, 10 candidates, budget 10)
+# Keyper P2P/DKG security regression tests
+python tests/test_security_fixes.py
+
+# Stress test (100 votes, 10 candidates, budget 10; on-chain)
 python -u tests/test_stress.py
 
-# Tally performance test (10,000 ballots)
+# Tally performance test (10,000 ballots; on-chain)
 python -u tests/test_tally_perf.py
 
 # Full test suite
 pytest
 ```
 
-78+ tests covering:
+Covers:
 - **Unit tests** — BLS12-381 curve constants, G2 point arithmetic, serialization/deserialization with subgroup checks, ElGamal encryption/decryption, homomorphic addition, BSGS discrete log, Lagrange coefficients, DKG (various n/t, Feldman verification, bad share rejection), range/budget/decryption ZK proofs (completeness, soundness, tampering, domain separation, election binding).
 - **Integration tests** — Full crypto pipeline (DKG → encrypt → prove → aggregate → threshold decrypt) without servers, including any-subset threshold property and decryption share proof verification.
-- **E2E tests** — Full HTTP lifecycle with signed P2P keyper DKG: single-choice elections, budget elections, 5-keyper elections, invalid vote rejection.
+- **On-chain e2e tests** — Full HTTP lifecycle with signed P2P keyper DKG against real contracts: single-choice elections, budget elections, late-keyper skip path, SDK transcript interop.
+- **Security regression tests** — audit-driven checks on keyper P2P/DKG behavior.
 - **Stress tests** — 100 concurrent votes with 10 candidates and budget 10; 10,000-ballot tally performance benchmarks.
 
 ## Project Structure
@@ -159,7 +164,7 @@ src/
 ├── voter.py               # Voter CLI
 ├── admin_tui.py           # Admin TUI with server management (rich)
 ├── dkg_coordinator.py     # Orchestrates keyper DKG HTTP APIs + publishes on-chain
-├── tally_aggregator.py    # On-chain tally aggregator (library + CLI; PLAN.md decision E)
+├── tally_aggregator.py    # On-chain tally aggregator (library + CLI, no Flask)
 ├── vote_proxy.py          # Dev-only ballot forwarder
 ├── wr_oracle.py           # Dev Wahlregister-Server stub (Schnorr on G1)
 ├── chain_setup.py         # anvil + forge create + publishElection helpers

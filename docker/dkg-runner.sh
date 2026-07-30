@@ -33,6 +33,8 @@ done
 echo "[dkg-runner] bootstrapping keyper tokens..."
 python dkg_coordinator.py bootstrap \
   --keyper-urls="$KEYPER_URLS" \
+  --rpc-url="$RPC_URL" \
+  --election-address="$ELECTION_ADDRESS" \
   --coordinator-signing-key="$COORDINATOR_SIGNING_KEY"
 
 echo "[dkg-runner] checking on-chain DKG state..."
@@ -51,6 +53,7 @@ fi
 echo "[dkg-runner] orchestrating DKG (n=$NUM_KEYPERS, t=$DKG_THRESHOLD)"
 exec python dkg_coordinator.py run \
   --keyper-urls="$KEYPER_URLS" \
+  --rpc-url="$RPC_URL" \
   --election-id="$ELECTION_ID" \
   --election-address="$ELECTION_ADDRESS" \
   --n="$NUM_KEYPERS" \

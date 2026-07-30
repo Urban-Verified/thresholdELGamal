@@ -12,9 +12,6 @@
 #                         transactions through.
 #
 # Optional .env:
-#   KEYPER_ID             Keyper ID assigned by the election administrator
-#                         (1-indexed, matches your position in the
-#                         KeyperSet). Default: 1.
 #   KEYPER_PORT           Port to listen on and publish to the host. Default: 5001.
 #   COORDINATOR_ADDRESS    The election administrator's coordinator address
 #                         (public, non-secret -- get it from them once, out
@@ -51,8 +48,6 @@ services:
     command:
       - python
       - keyper.py
-      - --id
-      - "${KEYPER_ID:-1}"
       - --port
       - "${KEYPER_PORT:-5001}"
       - --host

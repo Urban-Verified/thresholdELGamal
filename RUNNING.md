@@ -1,11 +1,7 @@
 # Running and Testing
 
-How to run the threshold-ElGamal voting system end-to-end, both the
-on-chain pipeline (target topology) and the legacy off-chain prototype,
+How to run the threshold-ElGamal voting system end-to-end, on-chain,
 plus how to run the test suite.
-
-For the architecture and migration history see [`PLAN.md`](PLAN.md);
-deferred work lives in [`TODO.md`](TODO.md).
 
 ## 1. Prerequisites
 
@@ -118,14 +114,17 @@ anvil --port 8545
 # (commitments + shares + reveals). No COORDINATOR_ADDRESS is set here,
 # so these run unauthenticated (single-operator dev mode) -- every
 # endpoint below works without a bearer token. See §3c for the
-# authenticated, multi-operator equivalent via Docker.
+# authenticated, multi-operator equivalent via Docker. There is no
+# --id flag -- each keyper's DKG index comes from the "keyper_id" field
+# in the /dkg/round1 call below, assigned by whoever drives that call
+# (here, the curl loop's own $kid variable).
 cd src
 KEYPER_PRIVATE_KEY=0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6 \
-  ../.venv/bin/python keyper.py --id 1 --port 5001 --rpc-url http://127.0.0.1:8545
+  ../.venv/bin/python keyper.py --port 5001 --rpc-url http://127.0.0.1:8545
 KEYPER_PRIVATE_KEY=0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a \
-  ../.venv/bin/python keyper.py --id 2 --port 5002 --rpc-url http://127.0.0.1:8545
+  ../.venv/bin/python keyper.py --port 5002 --rpc-url http://127.0.0.1:8545
 KEYPER_PRIVATE_KEY=0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba \
-  ../.venv/bin/python keyper.py --id 3 --port 5003 --rpc-url http://127.0.0.1:8545
+  ../.venv/bin/python keyper.py --port 5003 --rpc-url http://127.0.0.1:8545
 
 # Deploy KeyperSet + ElectionRegistry + an Election. Easiest: pop into
 # admin_tui.py options c then e (§3a) and grab the printed addresses.
@@ -271,8 +270,7 @@ state dirs — a real single-keyper-per-machine deployment never needs
 for i in 1 2 3; do
   cp .env.keyper.example .env.keyper$i
 done
-# Edit each .env.keyper<i>: KEYPER_PRIVATE_KEY (ANVIL_KEYS[2+i], same
-# keys §3b used), KEYPER_ID=<i>, KEYPER_PORT=1500<i>,
+# Edit each .env.keyper<i>: KEYPER_PRIVATE_KEY (ANVIL_KEYS[2+i], KEYPER_PORT=1500<i>,
 # RPC_URL=http://host.docker.internal:8545, COORDINATOR_ADDRESS=<from above>,
 # KEYPER_STATE_DIR_HOST=./keyper-state-<i>
 mkdir -p keyper-state-1 keyper-state-2 keyper-state-3
@@ -415,8 +413,6 @@ under SDK-built auditors.
 | `tally_aggregator ... private key required`                       | Pass `--private-key` or set `TALLY_AGGREGATOR_PRIVATE_KEY`. The signer must hold `TALLY_AGGREGATOR_ROLE` on the Election contract. |
 | `publishAggregate ... VotingStillOpen`                            | Chain time hasn't reached `votingEnd`. Run `anvil_setNextBlockTimestamp` past it (see test helpers).     |
 | Pytest budget-election test fails after a single-choice test     | The session previously fast-forwarded the chain. Tests use `chain.w3.eth.get_block("latest").timestamp` for `now`. |
-| `MismatchedABI` warning when calling `publishElection`            | Pre-fix; should be silent now (`RegistryClient` filters logs by emitter address).                        |
-| Legacy Flask tests fail when run together                         | Pre-existing fixed-port collision between `test_e2e.py`, `test_security_fixes.py`, and the comprehensive tests. Run files individually or use the on-chain test (4a) which uses free ports. |
 | §3c: a keyper's `/status` never flips `bootstrapped: true`        | `dkg-coordinator` needs to reach that keyper at `host.docker.internal:<port>`. Confirm `.env.coordinator`'s `KEYPER_URLS` ports match each keyper's `.env.keyper<i>`'s `KEYPER_PORT`. |
 | §3c: `Unauthorized` from a keyper endpoint                        | All three `.env.keyper<i>` files' `COORDINATOR_ADDRESS` must be byte-identical to each other and to the address matching `.env.coordinator`'s `COORDINATOR_SIGNING_KEY`. |
 | §3c: `tally-aggregator` loops `waiting: shares on chain 0/N`       | Check its logs for `decrypt trigger failed at <url>` — a keyper container may be down, or `coordinator-state/bootstrap_tokens.json` was never written (re-check the `dkg-coordinator` logs). |
@@ -441,8 +437,8 @@ src/
   keyper_persistence.py     Fernet-encrypted DKG secret / bootstrap-token persistence
   token_bootstrap.py        X25519 seal/unseal + EIP-191 payload hashing for /auth/bootstrap
   coordinator_state.py      Plaintext bootstrap_tokens.json hand-off (dkg-coordinator -> tally-aggregator)
-  tally_aggregator.py       On-chain tally aggregator (library + CLI; PLAN.md decision E)
-  dkg_coodinator.py         coordinates the entire dkg process among keypers
+  tally_aggregator.py       On-chain tally aggregator (library + CLI, no Flask)
+  dkg_coordinator.py        Orchestrates keyper DKG HTTP APIs + publishes on-chain
   vote_proxy.py             Dev-only ballot forwarder
   wr_oracle.py              Dev Wahlregister-Server stub (Schnorr on G1)
   voter.py                  Voter CLI: builds real ballot via sdk_compat.build_ballot

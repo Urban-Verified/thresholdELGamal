@@ -47,9 +47,56 @@ class Keyper:
     url: str
 
 
-def _keypers_from_urls(urls: list[str]) -> list[Keyper]:
-    # Assuming keyper ids are 1-indexed. ie 1,2,3
-    return [Keyper(kid=i + 1, url=u.rstrip("/")) for i, u in enumerate(urls)]
+def _resolve_kids_onchain(urls: list[str], rpc_url: str, election_address: str,
+                           *, timeout: float = 10.0) -> dict[str, int]:
+    """Resolve each keyper URL's real DKG index from the on-chain KeyperSet,
+    by asking it for the index of the address that URL's own /status
+    reports -- instead of trusting KEYPER_URLS list position. Returns
+    {url: kid} (1-indexed, matching KeyperSet.getMemberIndex()+1).
+    """
+    from eth_client import ElectionClient, EthChain, KeyperSetClient
+
+    chain = EthChain.connect(rpc_url)
+    keyper_set_addr = ElectionClient(chain, election_address).keyper_set_address()
+    ks = KeyperSetClient(chain, keyper_set_addr)
+
+    result: dict[str, int] = {}
+    for url in urls:
+        u = url.rstrip("/")
+        r = requests.get(f"{u}/status", timeout=timeout)
+        r.raise_for_status()
+        addr = r.json().get("address")
+        if not isinstance(addr, str) or not addr.startswith("0x"):
+            raise DKGCoordinatorError(f"{u}/status missing/invalid address")
+        try:
+            result[u] = ks.get_member_index(addr) + 1
+        except Exception as e:
+            raise DKGCoordinatorError(f"{u} (address {addr}) is not a KeyperSet member: {e}") from e
+    return result
+
+
+def _keypers_from_urls(urls: list[str], *, rpc_url: str | None = None,
+                        election_address: str | None = None) -> list[Keyper]:
+    """Assign each URL its DKG index.
+
+    Falls back to position (1-indexed, matching the historical KEYPER_URLS
+    ordering requirement) when no chain connection is given -- used by
+    admin_tui.py's in-process demo, whose committee is already correctly
+    ordered by construction. When rpc_url + election_address are both
+    given (the real CLI path), each keyper's real on-chain member index is
+    resolved instead, so KEYPER_URLS' order no longer matters.
+
+    Always returns the list sorted by kid -- callers (fetch_members_from_status
+    and anything that zips this list against another kid-ordered one) rely
+    on that invariant, which position-based assignment satisfied for free
+    but on-chain resolution doesn't automatically guarantee.
+    """
+    if rpc_url and election_address:
+        kids_by_url = _resolve_kids_onchain(urls, rpc_url, election_address)
+        keypers = [Keyper(kid=kids_by_url[u.rstrip("/")], url=u.rstrip("/")) for u in urls]
+    else:
+        keypers = [Keyper(kid=i + 1, url=u.rstrip("/")) for i, u in enumerate(urls)]
+    return sorted(keypers, key=lambda kp: kp.kid)
 
 
 def fetch_members_from_status(keypers: list[Keyper], *, timeout: float = 5.0) -> list[str]:
@@ -67,8 +114,7 @@ def fetch_members_from_status(keypers: list[Keyper], *, timeout: float = 5.0) ->
             raise DKGCoordinatorError(f"{kp.url}/status missing/invalid address")
         members_by_kid[kp.kid] = addr
 
-    # Deterministic, member-index order = keyper_id order.
-    return [members_by_kid[kp.kid] for kp in keypers]
+    return [members_by_kid[i] for i in range(1, len(keypers) + 1)]
 
 
 def build_keyper_urls_map(keypers: list[Keyper]) -> dict[str, str]:
@@ -194,7 +240,8 @@ def push_bootstrap(
         return False
 
 
-def bootstrap_keypers(keyper_urls: list[str], coordinator_signing_key: str) -> dict[str, str]:
+def bootstrap_keypers(keyper_urls: list[str], coordinator_signing_key: str, *,
+                       rpc_url: str | None = None, election_address: str | None = None) -> dict[str, str]:
     """One-shot token mint + push, reconciled against the persisted shared
     state file. Safe to call on every dkg-runner invocation regardless of
     whether the DKG ceremony itself has already run: a keyper that lost its
@@ -206,6 +253,10 @@ def bootstrap_keypers(keyper_urls: list[str], coordinator_signing_key: str) -> d
     No rotation otherwise -- tokens are minted once and persisted on both
     sides (this file, and each keyper's own encrypted volume).
 
+    ``rpc_url``/``election_address``: when both given, each keyper's index
+    is resolved from the on-chain KeyperSet instead of KEYPER_URLS list
+    position -- see ``_keypers_from_urls``.
+
     Returns {url: api_token} for immediate use by this same process's DKG
     ceremony. Returns {} (and does nothing else) if
     ``coordinator_signing_key`` is empty -- single-operator dev mode,
@@ -214,7 +265,7 @@ def bootstrap_keypers(keyper_urls: list[str], coordinator_signing_key: str) -> d
     if not coordinator_signing_key:
         return {}
 
-    keypers = _keypers_from_urls(keyper_urls)
+    keypers = _keypers_from_urls(keyper_urls, rpc_url=rpc_url, election_address=election_address)
     member_addrs = fetch_members_from_status(keypers)
     existing = coordinator_state.load_tokens()
 
@@ -296,6 +347,7 @@ def run_dkg(
     t: int,
     members: Optional[list[str]] = None,
     api_tokens: Optional[dict[str, str]] = None,
+    rpc_url: Optional[str] = None,
     timeout: float = 60.0,
     sleep_between: float = 0.0,
     verbose: bool = True,
@@ -311,8 +363,14 @@ def run_dkg(
     pass None/{}) for single-operator dev mode (e.g. admin_tui.py), which
     also switches distribute_commitments/distribute_shares back to sending
     ``keyper_urls`` in the body -- see keyper.py's AUTH_REQUIRED fallback.
+
+    ``rpc_url``: when given (alongside the always-required
+    ``election_address``), each keyper's DKG index is resolved from the
+    on-chain KeyperSet instead of ``keyper_urls`` list position -- see
+    ``_keypers_from_urls``. Omitted by admin_tui.py, whose committee is
+    already correctly ordered by construction.
     """
-    keypers = _keypers_from_urls(keyper_urls)
+    keypers = _keypers_from_urls(keyper_urls, rpc_url=rpc_url, election_address=election_address)
     if len(keypers) != n:
         raise DKGCoordinatorError(f"n={n} but got {len(keypers)} keyper URLs")
     if members is None:
@@ -405,12 +463,21 @@ def run_dkg(
         print("[dkg] done")
 
 
+def _require(value: str | None, flag: str, env: str) -> str:
+    if not value:
+        raise SystemExit(f"error: {flag} required: pass {flag} or set ${env}")
+    return value
+
+
 def _cmd_bootstrap(args) -> int:
     keyper_urls = [u.strip() for u in args.keyper_urls.split(",") if u.strip()]
     if not args.coordinator_signing_key:
         print("[bootstrap] coordinator-signing-key empty -- single-operator dev mode, nothing to do")
         return 0
-    tokens = bootstrap_keypers(keyper_urls, args.coordinator_signing_key)
+    rpc_url = _require(args.rpc_url, "--rpc-url", "RPC_URL")
+    election_address = _require(args.election_address, "--election-address", "ELECTION_ADDRESS")
+    tokens = bootstrap_keypers(keyper_urls, args.coordinator_signing_key,
+                                rpc_url=rpc_url, election_address=election_address)
     print(f"[bootstrap] done -- {len(tokens)} keyper(s) have a token on record "
           f"at {coordinator_state.bootstrap_tokens_file()}")
     return 0
@@ -418,6 +485,7 @@ def _cmd_bootstrap(args) -> int:
 
 def _cmd_run(args) -> int:
     keyper_urls = [u.strip() for u in args.keyper_urls.split(",") if u.strip()]
+    rpc_url = _require(args.rpc_url, "--rpc-url", "RPC_URL")
     persisted = coordinator_state.load_tokens()
     api_tokens = {url: toks["api_token"] for url, toks in persisted.items()} if persisted else None
     run_dkg(
@@ -427,6 +495,7 @@ def _cmd_run(args) -> int:
         n=args.n,
         t=args.t,
         api_tokens=api_tokens,
+        rpc_url=rpc_url,
         timeout=args.timeout,
         sleep_between=args.sleep_between,
         verbose=not args.quiet,
@@ -445,12 +514,21 @@ def main() -> None:
 
     p_boot = sub.add_parser("bootstrap", help="Mint/push keyper bearer tokens, write the shared state file")
     p_boot.add_argument("--keyper-urls", required=True, help="Comma-separated keyper base URLs")
+    p_boot.add_argument("--rpc-url", default=os.environ.get("RPC_URL"),
+                         help="Ethereum RPC URL -- resolves each keyper's real DKG index via the "
+                              "on-chain KeyperSet instead of trusting --keyper-urls order.")
+    p_boot.add_argument("--election-address", default=os.environ.get("ELECTION_ADDRESS"),
+                         help="Election contract address (0x...) -- its configured KeyperSet is "
+                              "the source of truth for each keyper's index.")
     p_boot.add_argument("--coordinator-signing-key", default=os.environ.get("COORDINATOR_SIGNING_KEY", ""),
                          help="This coordinator's own EIP-191 signing key. Empty = single-operator dev mode.")
     p_boot.set_defaults(func=_cmd_bootstrap)
 
     p_run = sub.add_parser("run", help="Orchestrate the DKG ceremony across keypers and publish on chain")
     p_run.add_argument("--keyper-urls", required=True, help="Comma-separated keyper base URLs")
+    p_run.add_argument("--rpc-url", default=os.environ.get("RPC_URL"),
+                        help="Ethereum RPC URL -- resolves each keyper's real DKG index via the "
+                             "on-chain KeyperSet instead of trusting --keyper-urls order.")
     p_run.add_argument("--election-id", required=True, help="Opaque election id string for keypers (e.g. demo-election)")
     p_run.add_argument("--election-address", required=True, help="Election contract address (0x...)")
     p_run.add_argument("--n", type=int, required=True, help="Number of keypers")

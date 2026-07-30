@@ -128,7 +128,7 @@ mkdir -p keyper-state
 docker compose -f docker-compose.keyper.yml up -d --build
 ```
 
-Fill in `.env`: `KEYPER_PRIVATE_KEY`, `RPC_URL`, `KEYPER_ID`, `KEYPER_PORT`,
+Fill in `.env`: `KEYPER_PRIVATE_KEY`, `RPC_URL`, `KEYPER_PORT`,
 and (once the administrator has generated one) `COORDINATOR_ADDRESS`.
 Share your public URL with the administrator during onboarding — no
 token to generate or exchange yourself.
@@ -150,10 +150,11 @@ mkdir -p coordinator-state
 docker compose -f docker-compose.coordinator.yml up --build
 ```
 
-Fill in `.env`: `KEYPER_URLS` (every keyper operator's public URL, in
-`KeyperSet` member order), `NUM_KEYPERS`, `DKG_THRESHOLD`, `RPC_URL`,
-`ELECTION_ADDRESS`, `ELECTION_ID`, `COORDINATOR_SIGNING_KEY`,
-`TALLY_AGGREGATOR_PRIVATE_KEY`, `TALLY_POLL_SECONDS`.
+Fill in `.env`: `KEYPER_URLS` (every keyper operator's public URL — any
+order; `dkg-coordinator` resolves each one's real DKG index from the
+on-chain `KeyperSet`, not from position in this list), `NUM_KEYPERS`,
+`DKG_THRESHOLD`, `RPC_URL`, `ELECTION_ADDRESS`, `ELECTION_ID`,
+`COORDINATOR_SIGNING_KEY`, `TALLY_AGGREGATOR_PRIVATE_KEY`, `TALLY_POLL_SECONDS`.
 
 `dkg-coordinator` bootstraps tokens, runs DKG, and exits 0. Watch it:
 
@@ -185,11 +186,11 @@ Run `docker-compose.keyper.yml` more than once with different project
 names, ports, and state directories:
 
 ```sh
-KEYPER_ID=1 KEYPER_PORT=5001 KEYPER_STATE_DIR_HOST=./keyper-state-1 \
+KEYPER_PORT=5001 KEYPER_STATE_DIR_HOST=./keyper-state-1 \
   docker compose -p keyper1 -f docker-compose.keyper.yml up -d
-KEYPER_ID=2 KEYPER_PORT=5002 KEYPER_STATE_DIR_HOST=./keyper-state-2 \
+KEYPER_PORT=5002 KEYPER_STATE_DIR_HOST=./keyper-state-2 \
   docker compose -p keyper2 -f docker-compose.keyper.yml up -d
-KEYPER_ID=3 KEYPER_PORT=5003 KEYPER_STATE_DIR_HOST=./keyper-state-3 \
+KEYPER_PORT=5003 KEYPER_STATE_DIR_HOST=./keyper-state-3 \
   docker compose -p keyper3 -f docker-compose.keyper.yml up -d
 ```
 
