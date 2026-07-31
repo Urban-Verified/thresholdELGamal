@@ -241,3 +241,22 @@ which must stay reachable before any token exists to check against.
 - **eth-account / eth-utils** — EIP-191 personal_sign / recover used to authenticate every keyper-to-keyper DKG message
 - **web3.py** — chain interactions against the production bulletin-board contracts
 - **rich** — Terminal UI rendering (panels, tables, progress bars, live displays)
+
+---
+
+## Licence
+
+Copyright (C) 2026 Brainbot GmbH
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License, version 3 only, as published
+by the Free Software Foundation.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>.
+
+SPDX-License-Identifier: AGPL-3.0-only
