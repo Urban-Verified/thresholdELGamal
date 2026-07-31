@@ -79,6 +79,15 @@ pip install -r requirements.txt
 
 For the full on-chain end-to-end runbook, see `RUNNING.md` §3.
 
+### Multi-operator deployment
+
+For a real deployment — independently-operated keypers, each holding only
+their own key, talking over a network with bearer-token auth and
+encrypted persisted state — see `docker/README.md` and `RUNNING.md` §3c.
+`docker-compose.keyper.yml` runs one keyper; `docker-compose.coordinator.yml`
+runs `dkg-coordinator` (bootstraps tokens, drives DKG) and `tally-aggregator`
+(publishes the aggregate, triggers keyper decryption, finalizes the result).
+
 ### Interactive TUI (recommended)
 
 The admin TUI can launch all servers, create elections, run DKG, monitor ballots, and tally — all from one terminal:
@@ -104,26 +113,31 @@ then `q` to quit.
 ```bash
 cd src
 
-# Full test suite (78 unit/integration/e2e tests)
+# Pure crypto unit + integration tests (no chain, no Flask)
 python -m pytest tests/test_comprehensive.py -v
 
-# Standalone E2E tests (4 HTTP lifecycle tests)
-python -m pytest tests/test_e2e.py -v
+# On-chain e2e tests (anvil + forge required) -- full HTTP lifecycle
+# with signed P2P keyper DKG, on real Election/KeyperSet contracts
+python -m pytest tests/test_e2e_onchain.py -v
 
-# Stress test (100 votes, 10 candidates, budget 10)
+# Keyper P2P/DKG security regression tests
+python tests/test_security_fixes.py
+
+# Stress test (100 votes, 10 candidates, budget 10; on-chain)
 python -u tests/test_stress.py
 
-# Tally performance test (10,000 ballots)
+# Tally performance test (10,000 ballots; on-chain)
 python -u tests/test_tally_perf.py
 
 # Full test suite
 pytest
 ```
 
-78+ tests covering:
+Covers:
 - **Unit tests** — BLS12-381 curve constants, G2 point arithmetic, serialization/deserialization with subgroup checks, ElGamal encryption/decryption, homomorphic addition, BSGS discrete log, Lagrange coefficients, DKG (various n/t, Feldman verification, bad share rejection), range/budget/decryption ZK proofs (completeness, soundness, tampering, domain separation, election binding).
 - **Integration tests** — Full crypto pipeline (DKG → encrypt → prove → aggregate → threshold decrypt) without servers, including any-subset threshold property and decryption share proof verification.
-- **E2E tests** — Full HTTP lifecycle with signed P2P keyper DKG: single-choice elections, budget elections, 5-keyper elections, invalid vote rejection.
+- **On-chain e2e tests** — Full HTTP lifecycle with signed P2P keyper DKG against real contracts: single-choice elections, budget elections, late-keyper skip path, SDK transcript interop.
+- **Security regression tests** — audit-driven checks on keyper P2P/DKG behavior.
 - **Stress tests** — 100 concurrent votes with 10 candidates and budget 10; 10,000-ballot tally performance benchmarks.
 
 ## Project Structure
@@ -144,24 +158,38 @@ src/
 │   ├── test_stress.py         # On-chain stress smoke tests
 │   └── test_tally_perf.py     # On-chain perf smoke tests
 ├── keyper.py              # Keyper server (Flask) with signed P2P DKG (commitments + shares)
+├── keyper_persistence.py  # Fernet-encrypted DKG secret / bootstrap-token persistence
+├── token_bootstrap.py     # X25519 seal/unseal + EIP-191 payload hashing for /auth/bootstrap
+├── coordinator_state.py   # Plaintext bootstrap_tokens.json hand-off (dkg-coordinator -> tally-aggregator)
 ├── voter.py               # Voter CLI
 ├── admin_tui.py           # Admin TUI with server management (rich)
 ├── dkg_coordinator.py     # Orchestrates keyper DKG HTTP APIs + publishes on-chain
-├── tally_aggregator.py    # On-chain tally aggregator (library + CLI; PLAN.md decision E)
+├── tally_aggregator.py    # On-chain tally aggregator (library + CLI, no Flask)
 ├── vote_proxy.py          # Dev-only ballot forwarder
 ├── wr_oracle.py           # Dev Wahlregister-Server stub (Schnorr on G1)
 ├── chain_setup.py         # anvil + forge create + publishElection helpers
 ├── eth_client.py          # web3.py wrappers for KeyperSet / Registry / Election
 ├── sdk_compat.py          # Python port of the shutter-voting-sdk subset we need
 └── requirements.txt
+
+docker-compose.keyper.yml         # Multi-operator: one independently-run keyper
+docker-compose.coordinator.yml    # Multi-operator: dkg-coordinator + tally-aggregator
 ```
 
 ## API Reference
 
-### Keyper (P2P endpoints)
+### Keyper endpoints
+
+Every endpoint below requires a bearer token once the keyper is started
+with `COORDINATOR_ADDRESS` set (multi-operator mode — see "Multi-operator
+deployment" below) — except `/status`, `/health`, and `/auth/bootstrap`,
+which must stay reachable before any token exists to check against.
 
 | Endpoint | Method | Description |
 |---|---|---|
+| `/status` | GET | Identity, encryption pubkey (+ signature), `bootstrapped`/`dkg_completed` flags |
+| `/health` | GET | Liveness probe (uptime, DKG-in-progress flag) |
+| `/auth/bootstrap` | POST | Coordinator-pushed bearer-token install (X25519 sealed box + EIP-191 signed) |
 | `/dkg/round1` | POST | Generate polynomial + commitments + shares; pin election context |
 | `/dkg/distribute_commitments` | POST | Fan out signed commitments to other keypers |
 | `/dkg/receive_commitments` | POST | Append-only, signature-verified intake from a peer |
@@ -190,6 +218,13 @@ src/
 - Domain separation across proof types
 - Budget proof Fiat-Shamir transcript binds P₂ and mpk per protocol spec
 - Optional election ID binding in proofs
+- Multi-operator keyper authentication (two-tier bearer tokens minted and
+  pushed by `dkg-coordinator` over an X25519 sealed box, EIP-191 signed
+  against a keyper's own configured `COORDINATOR_ADDRESS`; no unauthenticated
+  route accepts caller-supplied peer addresses)
+- Encrypted-at-rest keyper state (DKG secret, bootstrap tokens, bootstrap
+  encryption keypair — Fernet, key derived from the keyper's own signing
+  key) so a restart never needs a fresh DKG ceremony or re-bootstrap
 
 **Not implemented (requires deployment context):**
 - Voter authentication (OIDC / Keycloak)

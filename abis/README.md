@@ -5,7 +5,7 @@ ABIs for the production voting contracts at
 
 These are vendored (not loaded from a sibling repo at runtime) so this
 repo's Python code can run without a parallel checkout for read-only
-chain access. See [`PLAN.md`](../PLAN.md) §7.
+chain access.
 
 ## Contents
 

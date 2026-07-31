@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import secrets
 import sys
 import time
 import threading
@@ -26,6 +27,7 @@ from rich.live import Live
 from rich.align import Align
 from rich import box
 
+import keyper
 from keyper import create_keyper_app
 from wr_oracle import create_wr_oracle_app
 from vote_proxy import create_vote_proxy_app
@@ -89,6 +91,16 @@ _chain_state: dict = {
     "wr_sk": None,           # int (Schnorr secret on G1)
     "wr_pk": None,           # bytes (48-byte compressed G1, written to Election.pkWR)
     "wr_url": None,          # http://127.0.0.1:<port>/  for the wr_oracle process
+    # This demo session's own coordinator identity. Generated once, the
+    # first time keypers are started, and used to force every keyper this
+    # TUI runs into authenticated mode -- there is no unauthenticated path
+    # for a real running keyper server, demo or otherwise; only a handful
+    # of low-level unit tests construct a bare create_keyper_app() directly
+    # to test DKG wire logic in isolation, which is a different thing from
+    # a keyper actually listening on a port.
+    "coordinator_signing_key": None,  # private key string
+    "coordinator_addr": None,
+    "api_tokens": {},        # {keyper_url: api_token}, from dkg_coordinator.bootstrap_keypers
 }
 
 
@@ -151,6 +163,7 @@ def run_dkg_tui(keyper_urls):
                 election_address=election_addr,
                 n=n,
                 t=t_degree,
+                api_tokens=_chain_state.get("api_tokens"),
                 timeout=120.0,
                 sleep_between=0.0,
                 verbose=True,
@@ -180,6 +193,19 @@ def start_servers_tui(keyper_urls, keyper_host, *, confirm: bool = True):
             "  match the on-chain committee.[/]",
         )
         return
+
+    # This demo session's own coordinator identity. Generated once and
+    # reused for the life of this TUI process. Every keyper this TUI starts
+    # is forced into authenticated mode -- a real running keyper server is
+    # never left unauthenticated just because this is a single-machine
+    # demo; only a handful of low-level unit tests construct a bare
+    # create_keyper_app() directly to test DKG wire logic in isolation,
+    # which never listens on a port at all.
+    if _chain_state.get("coordinator_signing_key") is None:
+        _chain_state["coordinator_signing_key"] = "0x" + secrets.token_bytes(32).hex()
+        _chain_state["coordinator_addr"] = Account.from_key(_chain_state["coordinator_signing_key"]).address
+    keyper.COORDINATOR_ADDRESS = _chain_state["coordinator_addr"]
+    keyper.AUTH_REQUIRED = True
 
     # Check what's already running
     already_running = [
@@ -273,8 +299,18 @@ def start_servers_tui(keyper_urls, keyper_host, *, confirm: bool = True):
 
     console.print()
     if all_ok:
+        console.print("  Bootstrapping keyper bearer tokens…")
+        try:
+            api_tokens = dkg_coordinator.bootstrap_keypers(
+                keyper_urls, _chain_state["coordinator_signing_key"],
+            )
+            _chain_state["api_tokens"] = api_tokens
+            console.print(f"  [green]✓[/] {len(api_tokens)}/{len(keyper_urls)} keypers bootstrapped")
+        except Exception as e:
+            console.print(f"  [red]✗[/] Bootstrap failed: {e}")
+
         console.print(Panel(
-            f"[bold green]  ✓ KEYPERS RUNNING[/]\n\n"
+            f"[bold green]  ✓ KEYPERS RUNNING (authenticated)[/]\n\n"
             f"  [bold]{len(keyper_urls)}[/] keypers\n"
             f"  [dim]Servers run as daemon threads — they stop when this TUI exits.[/]",
             border_style="green",
@@ -797,12 +833,16 @@ def submit_decryption_shares_tui(keyper_urls: list[str]):
         console.print("  [dim]Cancelled.[/]")
         return
 
+    api_tokens = _chain_state.get("api_tokens") or {}
     ok = 0
     for i, url in enumerate(keyper_urls, start=1):
+        token = api_tokens.get(url.rstrip("/"), "")
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
         try:
             r = requests.post(
                 f"{url.rstrip('/')}/decrypt/publish_on_chain",
                 json={"election_address": election_addr},
+                headers=headers,
                 timeout=120,
             )
             body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {"text": r.text}

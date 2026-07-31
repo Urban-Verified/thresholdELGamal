@@ -9,30 +9,51 @@ Each keyper runs as an independent HTTP server and participates in:
 All operations use BLS12-381 G2.
 
 Usage:
-    python keyper.py --id 1 --port 5001
-    python keyper.py --id 2 --port 5002
-    python keyper.py --id 3 --port 5003
+    KEYPER_PRIVATE_KEY=0x... python keyper.py --port 5001
+
+A keyper's DKG index is resolved by the coordinator from the on-chain KeyperSet
+(matching this keyper's own signing address) and adopted at /dkg/round1 time.
 """
 
 import argparse
+import base64
 import hashlib
 import json
+import logging
 import os
+import secrets
 import sys
+import time
 import requests
+from cryptography.fernet import Fernet
 from flask import Flask, request, jsonify
+
+# Empty string = single-operator dev mode; before_request guard is a no-op.
+# Non-empty = multi-operator mode; bearer tokens are minted by dkg-coordinator
+# and installed at runtime via POST /auth/bootstrap, never read from an env
+# var. See docker/README.md "Auth & bootstrap" (mirrors sx-monorepo's design).
+COORDINATOR_ADDRESS = os.environ.get("COORDINATOR_ADDRESS", "")
+AUTH_REQUIRED = bool(COORDINATOR_ADDRESS)
 
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from eth_utils import keccak
 
 from crypto.primitives import (
-    point_to_dict, dict_to_point, CURVE_ORDER,
+    point_to_dict, dict_to_point, CURVE_ORDER, G2,
     g2_to_compressed, g2_from_compressed,
     point_multiply,
 )
 from crypto.dkg import KeyperDKGState, derive_joint_mpk, derive_mpk_share
 from crypto.proofs import prove_decryption_share
+from keyper_persistence import (
+    load_bootstrap_tokens,
+    load_dkg_secret,
+    load_or_create_encryption_key,
+    save_bootstrap_tokens,
+    save_dkg_secret,
+)
+from token_bootstrap import NonceTracker, enc_pubkey_hash, payload_hash, x25519_unseal
 import sdk_compat
 
 
@@ -102,7 +123,20 @@ def _recover(payload_hash: bytes, signature_hex: str) -> str:
     return Account.recover_message(msg, signature=bytes.fromhex(signature_hex.removeprefix("0x")))
 
 
-def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
+# ----------------------------------------------------------------------
+#  DKG secret / bootstrap-token persistence — see keyper_persistence.py
+#
+#  Fernet key is derived from this keyper's own signing key so no
+#  separate secret needs to be provisioned just for state encryption.
+# ----------------------------------------------------------------------
+
+def _derive_fernet(private_key_hex: str) -> Fernet:
+    raw = bytes.fromhex(private_key_hex.removeprefix('0x'))
+    key = base64.urlsafe_b64encode(hashlib.sha256(b'KEYPER-DKG-STATE-v1' + raw).digest())
+    return Fernet(key)
+
+
+def create_keyper_app(keyper_id=None, *, chain_config=None, signing_key=None):
     """Create a Flask app for a single keyper.
 
     ``chain_config`` is an optional dict ``{"rpc_url": str, "private_key": str}``
@@ -112,21 +146,118 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
     messages (commitments, shares, reveals). If omitted but
     ``chain_config`` is provided, the chain key doubles as the signing
     key. If neither is provided, a deterministic key is derived from
-    ``keyper_id`` so off-chain dev runs and tests still work.
+    ``keyper_id`` so off-chain dev runs and tests still work (this path
+    requires ``keyper_id`` -- the real deployment path always supplies a
+    real signing key instead).
+
+    ``keyper_id`` is optional and, for the real deployment path, normally
+    omitted entirely: a keyper's DKG index is not statically configured
+    -- it's resolved by the coordinator from the on-chain KeyperSet
+    (matching this keyper's own signing address) and adopted the first
+    time /dkg/round1 is called, or restored from persisted state on
+    restart. Passing an explicit ``keyper_id`` remains supported for
+    admin_tui.py's in-process demo and this package's own tests, which
+    already know their own index a priori from local, non-chain setup.
     """
     if signing_key is None:
         if chain_config is not None:
             signing_key = chain_config["private_key"]
-        else:
+        elif keyper_id is not None:
             # Deterministic dev fallback so off-chain test runs work
             # without explicit chain config.
             seed = hashlib.sha256(f"keyper-{keyper_id}".encode()).digest()
             signing_key = "0x" + seed.hex()
+        else:
+            raise ValueError(
+                "create_keyper_app requires signing_key, chain_config, or keyper_id "
+                "(the last only as a seed for the deterministic dev fallback key)"
+            )
     signing_address = Account.from_key(signing_key).address
+    # Persisted state is namespaced by this keyper's own signing address,
+    # not its (possibly still-unknown) DKG index -- see keyper_persistence.py.
+    identity = signing_address
+    logger = logging.getLogger(f'keyper.{signing_address[:10]}')
 
-    app = Flask(f"keyper_{keyper_id}")
+    app = Flask(f"keyper_{signing_address[:10]}")
+    start_time = time.time()
+
+    # This keyper's outbound address book -- {kid_str: {"url", "token"}} for
+    # every *other* keyper -- both where to reach it and what to authenticate
+    # with, from the same trusted source. Delivered by POST /auth/bootstrap
+    # (not /dkg/round1 -- DKG endpoints carry no auth material or destination
+    # data at all), and persisted to disk alongside this keyper's own tokens
+    # so a restart needs no re-bootstrap.
+    peers: dict[str, dict[str, str]] = {}
+
+    # This keyper's own required inbound credentials, installed by
+    # POST /auth/bootstrap. None until the first successful bootstrap --
+    # the guard below must fail closed on None, not skip the check.
+    installed: dict[str, str | None] = {"api_token": None, "peer_token": None}
+    bootstrap_nonces = NonceTracker()
+
+    # Routes only ever called by other keypers (P2P), never the coordinator
+    # or tally-aggregator -- checked against installed["peer_token"].
+    PEER_ROUTES = {"/dkg/receive_commitments", "/dkg/receive_share"}
+    # Called by the tally-aggregator (holds the same coordinator/API token
+    # dkg-coordinator does -- no separate token type for it, see
+    # keyper-token-bootstrap.md "Token Scoping") as well as the coordinator
+    # itself -- accepts either token.
+    DUAL_ROUTES = {"/decrypt/publish_on_chain"}
+    # Always reachable regardless of auth state -- /status and /health are
+    # health probes, /auth/bootstrap necessarily has to be reachable before
+    # any token exists to check against.
+    OPEN_ROUTES = {"/status", "/health", "/auth/bootstrap"}
+
+    @app.before_request
+    def require_bearer():
+        if not AUTH_REQUIRED:
+            return  # single-operator dev mode — no auth enforced
+        if request.path in OPEN_ROUTES:
+            return
+        tok = request.headers.get("Authorization", "")
+        if not tok.startswith("Bearer "):
+            return jsonify({"error": "Unauthorized"}), 401
+        presented = tok[7:]
+
+        if request.path in PEER_ROUTES:
+            expected = installed["peer_token"]
+            ok = expected is not None and secrets.compare_digest(presented, expected)
+        elif request.path in DUAL_ROUTES:
+            api_tok, peer_tok = installed["api_token"], installed["peer_token"]
+            ok = (api_tok is not None and secrets.compare_digest(presented, api_tok)) or \
+                 (peer_tok is not None and secrets.compare_digest(presented, peer_tok))
+        else:
+            expected = installed["api_token"]
+            ok = expected is not None and secrets.compare_digest(presented, expected)
+
+        if not ok:
+            # Uniform 401 whether the cause is "wrong token" or "no token
+            # installed yet" -- don't give a prober an oracle for which.
+            return jsonify({"error": "Unauthorized"}), 401
+
+    def _peer_auth_headers(recipient_id_str: str) -> dict:
+        """Auth header to attach when calling a peer keyper identified by its id string."""
+        tok = peers.get(str(recipient_id_str), {}).get("token", "")
+        return {"Authorization": f"Bearer {tok}"} if tok else {}
+
+    fernet = _derive_fernet(signing_key)
+    encryption_privkey = load_or_create_encryption_key(fernet, identity, logger)
+    encryption_pubkey_bytes = encryption_privkey.public_key().public_bytes_raw()
+    encryption_pubkey_hex = "0x" + encryption_pubkey_bytes.hex()
+    encryption_pubkey_sig = _sign(signing_key, enc_pubkey_hash(encryption_pubkey_bytes))
+    # Restore a prior bootstrap so a restart needs no re-push at all: no
+    # rotation happens, tokens are minted once and persisted on both sides.
+    _persisted_tokens = load_bootstrap_tokens(fernet, identity, logger)
+    if _persisted_tokens:
+        installed["api_token"] = _persisted_tokens.get("api_token")
+        installed["peer_token"] = _persisted_tokens.get("peer_token")
+        peers.update(_persisted_tokens.get("peers") or {})
+
     dkg_state = KeyperDKGState()
     keyper_meta = {
+        # None until adopted from the coordinator's /dkg/round1 call (or
+        # restored below from a completed prior ceremony) -- see the
+        # module docstring and create_keyper_app's own docstring.
         "id": keyper_id,
         "chain_config": chain_config,
         "signing_key": signing_key,
@@ -136,6 +267,19 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
     # the KeyperSet, used to verify P2P signatures from that dealer. The
     # election_id scopes the signed payload to a specific DKG instance.
     dkg_meta = {"election_id": None, "members": []}
+    # Restore a completed DKG's combined share (and the index it was
+    # assigned) so a restart doesn't need a fresh ceremony -- see
+    # keyper_persistence.dkg_secret_file. Without restoring keyper_id
+    # here too, a restarted keyper would have keyper_meta["id"] = None
+    # forever (dkg-runner.sh skips round1 once DKG is already finalized
+    # on-chain, so there's no second chance to relearn it from the
+    # coordinator) and every subsequent decrypt-share submission would break.
+    _persisted_dkg = load_dkg_secret(fernet, identity, logger)
+    if _persisted_dkg:
+        dkg_state.combined_share = _persisted_dkg["share"]
+        dkg_state.public_key_share = point_multiply(G2, _persisted_dkg["share"])
+        dkg_meta["election_id"] = _persisted_dkg["election_id"]
+        keyper_meta["id"] = _persisted_dkg["keyper_id"]
     # Local share storage (P2P).
     pending_shares = {}            # generated by us in round1, indexed by recipient_id
     received_shares = {}           # received from other keypers, indexed by dealer_id
@@ -158,7 +302,65 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
             "address": keyper_meta["signing_address"],
             "dkg_completed": dkg_state.combined_share is not None,
             "public_key_share": point_to_dict(dkg_state.public_key_share) if dkg_state.public_key_share else None,
+            # Bound to signing_address via encryption_pubkey_sig so the
+            # coordinator can trust this key without a separate exchange.
+            "encryption_pubkey": encryption_pubkey_hex,
+            "encryption_pubkey_sig": encryption_pubkey_sig,
+            # Non-sensitive operator-visibility flag.
+            "bootstrapped": installed["api_token"] is not None,
         })
+
+    @app.route("/health", methods=["GET"])
+    def health():
+        return jsonify({
+            "ok": True,
+            "dkg_in_progress": dkg_meta["election_id"] is not None and dkg_state.combined_share is None,
+            "uptime_s": int(time.time() - start_time),
+        })
+
+    @app.route("/auth/bootstrap", methods=["POST"])
+    def auth_bootstrap():
+        """Coordinator-pushed token installation.
+
+        Necessarily unauthenticated at the HTTP layer -- this call
+        establishes the very credentials every other route checks.
+        Authenticity instead comes from the EIP-191 signature embedded in
+        the sealed payload, verified against COORDINATOR_ADDRESS -- an
+        anonymous sealed box alone proves nothing about the sender, only
+        that this keyper's own private key was used to open it.
+        """
+        if not AUTH_REQUIRED:
+            return jsonify({"error": "bootstrap not applicable in single-operator mode"}), 400
+
+        try:
+            plaintext = x25519_unseal(request.get_data(), encryption_privkey)
+            envelope = json.loads(plaintext)
+            payload = envelope["payload"]
+            sig = envelope["sig"]
+        except Exception:
+            return jsonify({"error": "Unauthorized"}), 401
+
+        try:
+            recovered = _recover(payload_hash(payload), sig)
+        except Exception:
+            return jsonify({"error": "Unauthorized"}), 401
+        if recovered.lower() != COORDINATOR_ADDRESS.lower():
+            return jsonify({"error": "Unauthorized"}), 401
+        if str(payload.get("intended_recipient", "")).lower() != keyper_meta["signing_address"].lower():
+            return jsonify({"error": "Unauthorized"}), 401
+        if not bootstrap_nonces.check_and_record(payload.get("nonce", ""), int(payload.get("timestamp", 0))):
+            return jsonify({"error": "Unauthorized"}), 401
+
+        installed["api_token"] = str(payload["api_token"])
+        installed["peer_token"] = str(payload["peer_token"])
+        peers.clear()
+        peers.update({
+            str(k): {"url": str(v["url"]), "token": str(v["token"])}
+            for k, v in (payload.get("peers") or {}).items()
+        })
+        save_bootstrap_tokens(fernet, identity, installed["api_token"], installed["peer_token"], dict(peers))
+        logger.info("op=auth_bootstrap status=ok signer=%s", recovered)
+        return jsonify({"status": "ok"})
 
     @app.route("/dkg/round1", methods=["POST"])
     def dkg_round1():
@@ -177,8 +379,18 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
         election_id = data["election_id"]
         members = data.get("members", [])
 
-        if kid != keyper_meta["id"]:
+        # There is no statically-configured index to check against in the
+        # real deployment path (keyper_meta["id"] starts None) -- this
+        # keyper simply adopts whatever index the coordinator assigns,
+        # since the coordinator resolves it from the on-chain KeyperSet
+        # (KeyperSet.getMemberIndex against this keyper's own signing
+        # address) rather than from KEYPER_URLS list position. Callers
+        # that *do* pass an explicit keyper_id up front (admin_tui.py's
+        # in-process demo, this package's own tests) keep a real
+        # mismatch check -- a genuine misconfiguration there still fails loudly.
+        if keyper_meta["id"] is not None and kid != keyper_meta["id"]:
             return jsonify({"error": f"Keyper ID mismatch: configured as {keyper_meta['id']}, received {kid}"}), 400
+        keyper_meta["id"] = kid
         if not isinstance(members, list) or len(members) != n:
             return jsonify({"error": f"members must be a list of {n} addresses, got {len(members)}"}), 400
 
@@ -221,8 +433,7 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
         would catch that locally; for phase 1 the on-chain
         ``voteDKGResult`` threshold-vote does so by failing to finalize.
         """
-        data = request.get_json()
-        keyper_urls = data["keyper_urls"]   # {keyper_id_str: url}
+        data = request.get_json(silent=True) or {}
         kid = keyper_meta["id"]
 
         if dkg_meta["election_id"] is None:
@@ -238,12 +449,30 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
             "signature": signature,
         }
 
-        for recipient_id_str, url in keyper_urls.items():
+        if AUTH_REQUIRED:
+            # Fan out to the bootstrap-installed peers map -- never anything
+            # the request body supplies, so there's no destination data an
+            # attacker holding a leaked coordinator-tier token could redirect.
+            targets = {
+                rid: {"url": p["url"], "headers": _peer_auth_headers(rid)}
+                for rid, p in peers.items()
+            }
+        else:
+            # Single-operator dev mode (e.g. admin_tui.py's in-process demo,
+            # no coordinator ever bootstraps a peers map) -- no
+            # coordinator-tier token exists to leak, so the caller-supplied
+            # address book is safe to trust directly, same as before.
+            targets = {
+                rid: {"url": url, "headers": {}}
+                for rid, url in (data.get("keyper_urls") or {}).items()
+                if int(rid) != kid
+            }
+
+        for recipient_id_str, target in targets.items():
             recipient_id = int(recipient_id_str)
-            if recipient_id == kid:
-                continue   # we already have our own
             try:
-                resp = requests.post(f"{url}/dkg/receive_commitments", json=body, timeout=10)
+                resp = requests.post(f"{target['url']}/dkg/receive_commitments", json=body,
+                                      headers=target["headers"], timeout=10)
                 resp.raise_for_status()
             except Exception as e:
                 return jsonify({
@@ -299,31 +528,49 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
     @app.route("/dkg/distribute_shares", methods=["POST"])
     def distribute_shares():
         """Send our secret shares directly to each recipient keyper, signed."""
-        data = request.get_json()
-        keyper_urls = data["keyper_urls"]   # {keyper_id_str: url}
+        data = request.get_json(silent=True) or {}
         kid = keyper_meta["id"]
 
         if dkg_meta["election_id"] is None:
             return jsonify({"error": "Run /dkg/round1 first"}), 400
 
-        for recipient_id_str, url in keyper_urls.items():
+        # Our own share never leaves the process -- store it directly.
+        received_shares[kid] = pending_shares[kid]
+
+        if AUTH_REQUIRED:
+            # Fan out to the bootstrap-installed peers map -- never anything
+            # the request body supplies, so there's no destination data an
+            # attacker holding a leaked coordinator-tier token could redirect.
+            targets = {
+                rid: {"url": p["url"], "headers": _peer_auth_headers(rid)}
+                for rid, p in peers.items()
+            }
+        else:
+            # Single-operator dev mode (e.g. admin_tui.py's in-process demo,
+            # no coordinator ever bootstraps a peers map) -- no
+            # coordinator-tier token exists to leak, so the caller-supplied
+            # address book is safe to trust directly, same as before.
+            targets = {
+                rid: {"url": url, "headers": {}}
+                for rid, url in (data.get("keyper_urls") or {}).items()
+                if int(rid) != kid
+            }
+
+        for recipient_id_str, target in targets.items():
             recipient_id = int(recipient_id_str)
             share_val = pending_shares[recipient_id]
-            if recipient_id == kid:
-                received_shares[kid] = share_val
-                continue
             payload_hash = _share_payload_hash(
                 dkg_meta["election_id"], kid, recipient_id, share_val,
             )
             signature = _sign(keyper_meta["signing_key"], payload_hash)
             try:
-                resp = requests.post(f"{url}/dkg/receive_share", json={
+                resp = requests.post(f"{target['url']}/dkg/receive_share", json={
                     "election_id": dkg_meta["election_id"],
                     "dealer_id": kid,
                     "recipient_id": recipient_id,
                     "share": str(share_val),
                     "signature": signature,
-                }, timeout=10)
+                }, headers=target["headers"], timeout=10)
                 resp.raise_for_status()
             except Exception as e:
                 return jsonify({"error": f"Failed to send share to keyper {recipient_id}: {e}"}), 500
@@ -438,6 +685,10 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
         # uses the identical commitment set.
         last_round2["all_commitments"] = dict(all_commitments)
         last_round2["active_dealers"] = sorted(received_shares.keys())
+
+        # Persist so a restart doesn't need a fresh DKG ceremony.
+        save_dkg_secret(fernet, identity, dkg_meta["election_id"], combined_share, keyper_meta["id"])
+        logger.info("op=dkg_round2 election_id=%s status=verified", dkg_meta.get("election_id"))
 
         # Zeroize received shares after DKG completes.
         # Keep pending_shares alive until complaint resolution completes;
@@ -664,8 +915,12 @@ def create_keyper_app(keyper_id, *, chain_config=None, signing_key=None):
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s [%(name)s] %(message)s',
+        datefmt='%Y-%m-%dT%H:%M:%S',
+    )
     parser = argparse.ArgumentParser(description="Keyper server for threshold ElGamal voting")
-    parser.add_argument("--id", type=int, required=True, help="Keyper ID (1-indexed)")
     parser.add_argument("--port", type=int, required=True, help="Port to listen on")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
     parser.add_argument("--rpc-url", default=None,
@@ -676,16 +931,20 @@ def main():
     args = parser.parse_args()
 
     private_key = args.private_key or os.environ.get("KEYPER_PRIVATE_KEY")
+    if not private_key:
+        sys.exit(
+            "Error: KEYPER_PRIVATE_KEY is required (or --private-key)."
+        )
     chain_config = None
-    if args.rpc_url and private_key:
+    if args.rpc_url:
         chain_config = {"rpc_url": args.rpc_url, "private_key": private_key}
 
     # Same key signs both the chain transactions and the P2P DKG messages
     # so the recovered address matches the KeyperSet member entry.
-    app = create_keyper_app(args.id, chain_config=chain_config, signing_key=private_key)
+    app = create_keyper_app(chain_config=chain_config, signing_key=private_key)
+    signing_address = Account.from_key(private_key).address
     suffix = " [chain enabled]" if chain_config else ""
-    print(f"[Keyper {args.id}] Starting on {args.host}:{args.port}{suffix}")
-    print(f"[Keyper {args.id}] Signing address: {Account.from_key(private_key).address if private_key else '(deterministic dev key)'}")
+    print(f"[Keyper {signing_address}] Starting on {args.host}:{args.port}{suffix}")
     app.run(host=args.host, port=args.port, debug=False, use_reloader=False)
 
 
