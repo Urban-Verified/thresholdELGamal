@@ -24,7 +24,7 @@ from eth_account import Account
 from eth_account.messages import encode_defunct
 
 import coordinator_state
-from token_bootstrap import enc_pubkey_hash, payload_hash, x25519_seal
+from token_bootstrap import payload_hash, verify_encryption_pubkey, x25519_seal
 
 log = logging.getLogger('dkg')
 
@@ -136,17 +136,15 @@ def _verify_encryption_pubkey(address: str, pubkey_hex: str, sig_hex: str) -> X2
     """Verify a keyper's self-published encryption_pubkey is bound to its
     already-trusted signing address, then return the parsed public key.
 
-    Raises on any failure -- callers must treat that keyper as not
+    Thin wrapper over the shared ``token_bootstrap.verify_encryption_pubkey``
+    (the same check a dealer runs on a peer key before sealing a share),
+    re-raising as ``DKGCoordinatorError`` so callers treat that keyper as not
     bootstrappable this round rather than silently skipping verification.
     """
-    pubkey_bytes = bytes.fromhex(pubkey_hex.removeprefix("0x"))
-    msg = encode_defunct(primitive=enc_pubkey_hash(pubkey_bytes))
-    recovered = Account.recover_message(msg, signature=bytes.fromhex(sig_hex.removeprefix("0x")))
-    if recovered.lower() != address.lower():
-        raise DKGCoordinatorError(
-            f"encryption_pubkey signature mismatch for {address}: recovered {recovered}"
-        )
-    return X25519PublicKey.from_public_bytes(pubkey_bytes)
+    try:
+        return verify_encryption_pubkey(address, pubkey_hex, sig_hex)
+    except ValueError as e:
+        raise DKGCoordinatorError(str(e)) from e
 
 
 def fetch_encryption_pubkeys(
@@ -170,6 +168,29 @@ def fetch_encryption_pubkeys(
         except Exception as e:
             log.warning("op=fetch_encryption_pubkey keyper=%d status=error err=%s", kp.kid, e)
     return pubkeys
+
+
+def fetch_enc_pubkey_raw(keypers: list[Keyper], *, timeout: float = 5.0) -> dict[int, dict[str, str]]:
+    """Fetch each keyper's raw ``encryption_pubkey`` + binding signature from
+    ``/status``, for embedding in every *other* keyper's ``peers`` map.
+
+    Verification is deferred to the consuming dealer, which checks the key
+    against the recipient's on-chain member address before sealing a share to
+    it -- so this pass-through does not itself need to trust the values.
+    """
+    out: dict[int, dict[str, str]] = {}
+    for kp in keypers:
+        try:
+            r = requests.get(f"{kp.url}/status", timeout=timeout)
+            r.raise_for_status()
+            j = r.json()
+            out[kp.kid] = {
+                "enc_pubkey": j["encryption_pubkey"],
+                "enc_pubkey_sig": j["encryption_pubkey_sig"],
+            }
+        except Exception as e:
+            log.warning("op=fetch_enc_pubkey_raw keyper=%d status=error err=%s", kp.kid, e)
+    return out
 
 
 def fetch_bootstrapped_status(keypers: list[Keyper], *, timeout: float = 5.0) -> dict[int, bool]:
@@ -289,6 +310,7 @@ def bootstrap_keypers(keyper_urls: list[str], coordinator_signing_key: str, *,
 
     if target_kids:
         enc_pubkeys = fetch_encryption_pubkeys(keypers, member_addrs)
+        enc_raw = fetch_enc_pubkey_raw(keypers)
         pushed = 0
         for kp, addr in zip(keypers, member_addrs):
             if kp.kid not in target_kids:
@@ -298,13 +320,16 @@ def bootstrap_keypers(keyper_urls: list[str], coordinator_signing_key: str, *,
                 continue
             url = kp.url.rstrip("/")
             own = tokens_by_url[url]
-            # {kid: {"url", "token"}} for every *other* keyper -- both where
-            # to reach it and what to authenticate with, so DKG endpoints
-            # never need keyper_urls in their own request body at all.
+            # {kid: {"url", "token", "enc_pubkey", "enc_pubkey_sig"}} for every
+            # *other* keyper -- where to reach it, what to authenticate with,
+            # and the X25519 key to seal shares to (verified by the dealer
+            # against that keyper's on-chain member address before use). DKG
+            # endpoints never need keyper_urls in their own request body.
             peers = {
                 str(other.kid): {
                     "url": other.url,
                     "token": tokens_by_url[other.url.rstrip("/")]["peer_token"],
+                    **(enc_raw.get(other.kid) or {}),
                 }
                 for other in keypers if other.kid != kp.kid
             }
@@ -437,13 +462,40 @@ def run_dkg(
         if sleep_between:
             time.sleep(sleep_between)
 
-    # round2
+    # round2 -- collect complaints. A verified:false response carries
+    # recipient-signed accusations (DKG-ACCUSE-v1). If any keyper complains we
+    # halt before publishing -- a divergent transcript would just fail to
+    # finalize on chain -- and surface the evidence for manual resolution.
+    # Automated reveal -> adjudicate -> exclude -> re-round2 is future work;
+    # see dkg-complaint-resolution.md (scope B).
+    complaints: list[tuple[Keyper, dict]] = []
     for kp in keypers:
         if verbose:
             print(f"[dkg] round2: keyper {kp.kid}")
-        _post(kp.url, "/dkg/round2", {"election_id": election_id}, timeout=timeout, headers=_auth(kp))
+        resp = _post(kp.url, "/dkg/round2", {"election_id": election_id}, timeout=timeout, headers=_auth(kp))
+        if resp.get("verified") is False:
+            complaints.append((kp, resp))
         if sleep_between:
             time.sleep(sleep_between)
+
+    if complaints:
+        for kp, resp in complaints:
+            for acc in resp.get("accusations", []):
+                log.error(
+                    "op=dkg_complaint accuser_kid=%s accused_dealer_id=%s election_id=%s signature=%s",
+                    acc.get("recipient_id"), acc.get("accused_dealer_id"),
+                    acc.get("election_id"), acc.get("signature"),
+                )
+        accused = sorted({
+            acc.get("accused_dealer_id")
+            for _, resp in complaints
+            for acc in resp.get("accusations", [])
+        })
+        raise DKGCoordinatorError(
+            f"DKG halted: complaints against dealer(s) {accused}; not publishing on "
+            f"chain. Signed accusations logged above; resolve manually "
+            f"(see dkg-complaint-resolution.md)."
+        )
 
     # publish on chain
     for kp in keypers:
