@@ -23,6 +23,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from eth_account import Account
+from eth_account.messages import encode_defunct
 from eth_utils import keccak
 
 BOOTSTRAP_DST = b"KEYPER-TOKEN-BOOTSTRAP-v1"
@@ -45,6 +47,25 @@ def payload_hash(payload: dict) -> bytes:
 
 def enc_pubkey_hash(pubkey_bytes: bytes) -> bytes:
     return keccak(ENC_PUBKEY_DST + pubkey_bytes)
+
+
+def verify_encryption_pubkey(address: str, pubkey_hex: str, sig_hex: str) -> X25519PublicKey:
+    """Verify a keyper's self-published ``encryption_pubkey`` is bound to the
+    given (already-trusted, e.g. on-chain member) signing address, and return
+    the parsed X25519 public key.
+
+    Used both by the coordinator (to trust a keyper's key before sealing its
+    bootstrap envelope) and by a dealer (to trust a peer's key before sealing a
+    share to it -- so a key delivered via the coordinator's peers map can't be
+    substituted). Raises ``ValueError`` on any mismatch; callers must treat that
+    as "not usable", never seal to an unverified key.
+    """
+    pubkey_bytes = bytes.fromhex(pubkey_hex.removeprefix("0x"))
+    msg = encode_defunct(primitive=enc_pubkey_hash(pubkey_bytes))
+    recovered = Account.recover_message(msg, signature=bytes.fromhex(sig_hex.removeprefix("0x")))
+    if recovered.lower() != address.lower():
+        raise ValueError(f"encryption_pubkey signature mismatch for {address}: recovered {recovered}")
+    return X25519PublicKey.from_public_bytes(pubkey_bytes)
 
 
 def x25519_seal(plaintext: bytes, recipient_pubkey: X25519PublicKey) -> bytes:

@@ -195,7 +195,7 @@ which must stay reachable before any token exists to check against.
 | `/dkg/receive_commitments` | POST | Append-only, signature-verified intake from a peer |
 | `/dkg/distribute_shares` | POST | Fan out signed secret shares to other keypers |
 | `/dkg/receive_share` | POST | Append-only, signature-verified intake from a peer |
-| `/dkg/reveal_share` | POST | Signed share reveal for Feldman VSS complaint resolution |
+| `/dkg/reveal_share` | POST | Accusation-gated signed share reveal for Feldman VSS complaint resolution — requires a recipient-signed `DKG-ACCUSE-v1` accusation naming this dealer (body: `{"accusation": {...}}`); reveals only the accuser's own share |
 | `/dkg/round2` | POST | Verify received shares against received commitments |
 | `/dkg/publish_on_chain` | POST | Submit `voteDKGResult` (chain mode only) |
 | `/decrypt/publish_on_chain` | POST | Submit `submitDecryptionShare` (chain mode only) |
