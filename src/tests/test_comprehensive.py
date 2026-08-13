@@ -506,6 +506,42 @@ class TestDKGBasic(unittest.TestCase):
         for c in comms:
             validate_g2_point(c)
 
+    def test_round2_flags_dealer_with_wrong_length_commitments(self):
+        """A dealer that commits a higher-degree polynomial (commitment vector
+        longer than t+1) but sends a share satisfying the length-based Feldman
+        check must still be rejected. Otherwise every recipient's check passes
+        yet t+1 shares can no longer reconstruct the tally -- a silent,
+        one-dealer denial of decryption. The dealer must route into the
+        complaint path (bad_dealers), exactly like a bad share value."""
+        n, t = 3, 1
+        my_id = 2
+        recipient = KeyperDKGState()
+        recipient.round1(my_id, n, t)  # pins self.t = t
+
+        # Honest dealer 1, so round2 has a good dealer to contrast against.
+        honest = KeyperDKGState()
+        honest_comms, honest_shares = honest.round1(1, n, t)
+
+        # Malicious dealer 3 uses a degree-2 polynomial (t'=2 > t=1): its
+        # commitment vector has 3 entries instead of t+1 = 2, and the share it
+        # sends to my_id is f(my_id) for that degree-2 poly -- so the
+        # length-based Feldman check (range(len(comms))) would pass.
+        coeffs = [random_scalar() for _ in range(3)]
+        bad_comms = [point_multiply(G2, c) for c in coeffs]
+        x_power = 1
+        bad_share = 0
+        for c in coeffs:
+            bad_share = (bad_share + c * x_power) % CURVE_ORDER
+            x_power = (x_power * my_id) % CURVE_ORDER
+
+        all_comms = {1: honest_comms, 3: bad_comms}
+        received = {1: honest_shares[my_id], 3: bad_share}
+
+        with self.assertRaises(ValueError) as ctx:
+            recipient.round2(all_comms, received)
+        self.assertIn(3, ctx.exception.bad_dealers)
+        self.assertNotIn(1, ctx.exception.bad_dealers)
+
 
 # ======================================================================
 #  4. UNIT TESTS: Zero-Knowledge Proofs

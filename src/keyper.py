@@ -589,6 +589,19 @@ def create_keyper_app(keyper_id=None, *, chain_config=None, signing_key=None):
         except Exception as e:
             return jsonify({"error": f"Invalid commitment point: {e}"}), 400
 
+        # A degree-t dealing has exactly t+1 Feldman commitments. Any other
+        # length is malformed: a longer vector encodes a higher-degree
+        # polynomial whose shares still pass per-recipient Feldman checks but
+        # which t+1 shares can no longer reconstruct (silent tally break), and
+        # an empty vector later crashes mpk derivation. Reject at ingest.
+        # dkg_state.t is pinned by round1, which the election_id match above
+        # already implies ran; fail closed if it somehow hasn't.
+        expected_len = None if dkg_state.t is None else dkg_state.t + 1
+        if expected_len is None or len(commitments) != expected_len:
+            return jsonify({
+                "error": f"Commitment vector must have length t+1={expected_len}, got {len(commitments)}",
+            }), 400
+
         expected = _members_addr(dealer_id)
         if expected is None:
             return jsonify({"error": f"Unknown dealer_id {dealer_id}"}), 400

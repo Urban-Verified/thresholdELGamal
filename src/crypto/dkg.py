@@ -91,6 +91,16 @@ class KeyperDKGState:
         for dealer_id, share in received_shares.items():
             comms = all_commitments[dealer_id]
 
+            # A degree-t polynomial has exactly t+1 commitments. A dealer that
+            # sends any other length has not dealt a degree-t sharing: a longer
+            # vector encodes a higher-degree polynomial whose shares still pass
+            # the length-based Feldman check below but which t+1 shares can no
+            # longer reconstruct -- a silent, undetectable-until-decrypt tally
+            # break. Route it into the same complaint path as a bad share.
+            if self.t is None or len(comms) != self.t + 1:
+                bad_dealers.append(dealer_id)
+                continue
+
             # Verify: sᵢ · P₂ == Σⱼ (my_id^j mod q) · γⱼ
             expected = Z2
             x_power = 1  # my_id^j mod q, starting with my_id^0 = 1
