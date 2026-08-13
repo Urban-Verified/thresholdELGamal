@@ -452,6 +452,50 @@ class TestComplaintResolution(unittest.TestCase):
         self.assertEqual(rev.json()["dealer_id"], 2)
         self.assertEqual(rev.json()["recipient_id"], 1)
 
+    # ---- commitment-vector length validation (degree-t' attack) ----
+
+    def _valid_commitments(self, count):
+        """`count` well-formed G2 commitment points as wire dicts."""
+        from crypto.primitives import point_to_dict
+        return [point_to_dict(point_multiply(G2, random_scalar())) for _ in range(count)]
+
+    def _deliver_commitments(self, election_id, dealer_id, comm_dicts):
+        """Sign `comm_dicts` as `dealer_id` (so the only possible fault is the
+        vector length) and POST to keyper 1's receive_commitments."""
+        from keyper import _commitments_payload_hash, _sign
+        from crypto.primitives import dict_to_point
+        comm_points = [dict_to_point(c) for c in comm_dicts]
+        sig = _sign(_dev_signing_key(dealer_id),
+                    _commitments_payload_hash(election_id, dealer_id, comm_points))
+        return requests.post(f"{self.keyper_urls[0]}/dkg/receive_commitments", json={
+            "election_id": election_id, "dealer_id": dealer_id,
+            "commitments": comm_dicts, "signature": sig,
+        }, timeout=5)
+
+    def test_receive_commitments_rejects_overlength_vector(self):
+        """A validly-signed vector longer than t+1 encodes a higher-degree
+        polynomial; it must be refused at ingest, before it can reach round2
+        or mpk derivation."""
+        election_id = "test-comm-overlength"
+        self._round1_keyper1(election_id)  # pins t on keyper 1
+        resp = self._deliver_commitments(election_id, 2, self._valid_commitments(self.t + 2))
+        self.assertEqual(resp.status_code, 400, resp.text)
+
+    def test_receive_commitments_rejects_empty_vector(self):
+        """An empty vector is refused: besides being degenerate it would later
+        IndexError in derive_joint_mpk (reads gamma_0)."""
+        election_id = "test-comm-empty"
+        self._round1_keyper1(election_id)
+        resp = self._deliver_commitments(election_id, 2, [])
+        self.assertEqual(resp.status_code, 400, resp.text)
+
+    def test_receive_commitments_accepts_correct_length(self):
+        """Regression: a correctly-sized t+1 vector is still accepted."""
+        election_id = "test-comm-correct-len"
+        self._round1_keyper1(election_id)
+        resp = self._deliver_commitments(election_id, 2, self._valid_commitments(self.t + 1))
+        self.assertEqual(resp.status_code, 200, resp.text)
+
 class TestCoordinatorHaltOnComplaint(unittest.TestCase):
     """run_dkg must stop before publishing when any round2 reports a complaint,
     and surface the signed accusations (scope A: halt + evidence, not
