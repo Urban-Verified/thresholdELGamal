@@ -25,7 +25,16 @@ is handled by `forge script` against a local clone of the contracts repo.
 ## Source commit
 
 [`Urban-Verified/bulletin-board`](https://github.com/Urban-Verified/bulletin-board)
-@ `ed8f0b9b6a5fe23a38c9b2ceb061ff0f47910443` (captured at vendor time).
+@ `55eba7e39bd61cc9489bf72b9ac422aed4d2bde9`
+
+`Election.json` / `IElection.json` therefore differ from that commit:
+
+- `getBallot` / `getBallots` return `BallotView`, whose `zkProofHash`
+  (`bytes32`) replaces `zkProof` (`bytes`).
+- `VoteSubmitted` carries a third, non-indexed `bytes zkProof` — the full
+  proof now travels in the event rather than in contract storage.
+- `submitVote`'s input is **unchanged**, so the ballot-building and
+  submission path needs no changes.
 
 ## Refresh
 

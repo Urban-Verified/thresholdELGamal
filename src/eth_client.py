@@ -26,6 +26,7 @@ from typing import Any, Iterable
 
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
+from eth_utils import keccak
 from web3 import Web3
 from web3.contract import Contract
 
@@ -46,6 +47,21 @@ def _load_abi(name: str) -> list:
         )
     with path.open() as f:
         return json.load(f)
+
+
+# ----------------------------------------------------------------------
+#  Errors
+# ----------------------------------------------------------------------
+
+class BallotProofError(Exception):
+    """A ballot's zkProof could not be recovered, or failed its commitment.
+
+    Always fatal, never a per-ballot rejection: the proof lives in the
+    ``VoteSubmitted`` log while only ``keccak256(zkProof)`` is in contract
+    storage, so a missing or mismatched proof means the log source is
+    incomplete or wrong -- not that the voter cast an invalid ballot.
+    Treating it as a rejection would silently drop a valid vote.
+    """
 
 
 # ----------------------------------------------------------------------
@@ -330,6 +346,90 @@ class ElectionClient(_BaseClient):
         raw = self.contract.functions.getBallot(bytes(pseudonym)).call()
         return _decode_ballot(raw)
 
+    def get_ballot_proofs(
+        self,
+        ballot_indexes: Iterable[int],
+        *,
+        from_block: int = 0,
+        to_block: int | None = None,
+    ) -> dict[int, bytes]:
+        """Recover the ``zkProof`` for specific ballots from ``VoteSubmitted`` logs.
+
+        Contract storage holds only ``keccak256(zkProof)``; the proof bytes
+        themselves are published in the event (see
+        ``BALLOT_STORAGE_MIGRATION.md`` in the contracts repo).
+
+        Keyed by ``ballotIndex``, never by ``pseudonym``: re-votes append a
+        new ballot record, so one pseudonym can own several ballots and is
+        not a usable join key.
+
+        Filtering on ``ballotIndex`` -- an indexed topic -- rather than
+        scanning a block range is what bounds the response. Each proof is
+        ~56 KB of JSON hex at production election sizes, so a range scan
+        covering a busy window can return hundreds of megabytes; asking for a
+        known, bounded set of indexes cannot.
+
+        ``from_block`` still matters on a public chain: providers will refuse
+        or time out a scan starting at genesis. Pass the election's
+        deployment block.
+        """
+        indexes = list(ballot_indexes)
+        if not indexes:
+            return {}
+        latest = self.chain.w3.eth.block_number if to_block is None else to_block
+        logs = self.contract.events.VoteSubmitted().get_logs(
+            from_block=max(0, from_block),
+            to_block=latest,
+            argument_filters={"ballotIndex": indexes},
+        )
+        return {
+            int(log["args"]["ballotIndex"]): bytes(log["args"]["zkProof"])
+            for log in logs
+        }
+
+    def get_all_ballots_with_proofs(
+        self,
+        *,
+        from_block: int = 0,
+        page: int = 100,
+    ) -> list[dict]:
+        """Every ballot, with ``zkProof`` restored from logs and verified.
+
+        Storage rows are read in pages (a single ``eth_call`` for a whole
+        election can exceed provider response limits), then joined to the
+        logged proofs by ``ballotIndex`` and checked against the on-chain
+        commitment. The check is what makes the join trustworthy: a wrong or
+        tampered log fails it rather than silently poisoning the tally.
+
+        Raises ``BallotProofError`` -- never returns a partial list.
+        """
+        total = self.get_num_ballots()
+        ballots: list[dict] = []
+        proofs: dict[int, bytes] = {}
+        for start in range(0, total, page):
+            count = min(page, total - start)
+            ballots.extend(self.get_ballots(start, count))
+            # one bounded log request per page, not one scan for the whole
+            # election -- keeps each response to roughly page x 56 KB
+            proofs.update(
+                self.get_ballot_proofs(range(start, start + count), from_block=from_block)
+            )
+
+        for index, ballot in enumerate(ballots):
+            proof = proofs.get(index)
+            if proof is None:
+                raise BallotProofError(
+                    f"ballot {index}: no VoteSubmitted log carrying a proof "
+                    f"(scanned from block {from_block}; is the start block too high?)"
+                )
+            if keccak(proof) != ballot["zkProofHash"]:
+                raise BallotProofError(
+                    f"ballot {index}: logged proof does not match the on-chain "
+                    f"commitment {ballot['zkProofHash'].hex()}"
+                )
+            ballot["zkProof"] = proof
+        return ballots
+
     # --- decryption shares ---
 
     def submit_decryption_share(
@@ -405,7 +505,7 @@ def _decode_ballot(raw: tuple) -> dict:
         "pseudonym": bytes(raw[0]),
         "vk": bytes(raw[1]),
         "ciphertexts": [(bytes(c[0]), bytes(c[1])) for c in raw[2]],
-        "zkProof": bytes(raw[3]),
+        "zkProofHash": bytes(raw[3]),
         "voterSignature": bytes(raw[4]),
         "wrAttestation": bytes(raw[5]),
     }
