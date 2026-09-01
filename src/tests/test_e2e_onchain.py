@@ -37,6 +37,7 @@ logging.getLogger("werkzeug").setLevel(logging.ERROR)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eth_account import Account  # noqa: E402
+from eth_utils import keccak  # noqa: E402
 
 from chain_setup import (  # noqa: E402
     ANVIL_KEYS,
@@ -47,7 +48,7 @@ from chain_setup import (  # noqa: E402
     start_anvil,
     stop_anvil,
 )
-from eth_client import ElectionClient, EthChain  # noqa: E402
+from eth_client import BallotProofError, ElectionClient, EthChain  # noqa: E402
 from keyper import create_keyper_app  # noqa: E402
 from vote_proxy import create_vote_proxy_app  # noqa: E402
 from voter import cast_vote_via_proxy  # noqa: E402
@@ -830,3 +831,76 @@ def test_submit_vote_rejects_invalid_payload_fields(session_chain: _SessionChain
     proxy_signer = Account.from_key(session_chain.proxy_key)
     with pytest.raises(Exception):
         dep.election.submit_vote(ballot, signer=proxy_signer, value=0)
+
+
+def test_ballot_proof_recovered_from_logs_and_bound_to_commitment(
+    session_chain: _SessionChain,
+) -> None:
+    """The proof lives in the VoteSubmitted log, not storage.
+
+    Storage keeps only keccak256(zkProof), so the log is the only source of
+    the bytes -- and the commitment is what makes trusting that source safe.
+    """
+    dep = _bring_up_election(session_chain, num_candidates=3, budget=1)
+    dep.run_dkg()
+    assert cast_vote_via_proxy(
+        dep.proxy_url, session_chain.rpc_url, dep.election_address, [1, 0, 0],
+        wr_url=session_chain.wr_url,
+    )
+
+    # storage row carries the commitment, not the bytes
+    row = dep.election.get_ballots(0, 1)[0]
+    assert "zkProof" not in row
+    assert len(row["zkProofHash"]) == 32
+
+    # the joined read restores the bytes and they satisfy the commitment
+    ballots = dep.election.get_all_ballots_with_proofs()
+    assert len(ballots) == 1
+    assert len(ballots[0]["zkProof"]) > 0
+    assert keccak(ballots[0]["zkProof"]) == ballots[0]["zkProofHash"]
+
+
+def test_missing_proof_aborts_rather_than_rejecting_the_ballot(
+    session_chain: _SessionChain,
+) -> None:
+    """A proof that cannot be found must abort, never count as a rejection.
+
+    Downgrading it to a rejection would silently drop a valid vote and
+    publish a wrong tally -- the failure mode this design exists to avoid.
+    """
+    dep = _bring_up_election(session_chain, num_candidates=3, budget=1)
+    dep.run_dkg()
+    assert cast_vote_via_proxy(
+        dep.proxy_url, session_chain.rpc_url, dep.election_address, [1, 0, 0],
+        wr_url=session_chain.wr_url,
+    )
+
+    # scan window starting after the vote finds no log for it
+    future = session_chain.chain.w3.eth.block_number + 1_000
+    with pytest.raises(BallotProofError, match="no VoteSubmitted log"):
+        dep.election.get_all_ballots_with_proofs(from_block=future)
+
+
+def test_tampered_proof_fails_the_commitment_check(
+    session_chain: _SessionChain, monkeypatch,
+) -> None:
+    """A proof that does not hash to the stored commitment must be rejected."""
+    dep = _bring_up_election(session_chain, num_candidates=3, budget=1)
+    dep.run_dkg()
+    assert cast_vote_via_proxy(
+        dep.proxy_url, session_chain.rpc_url, dep.election_address, [1, 0, 0],
+        wr_url=session_chain.wr_url,
+    )
+
+    original = ElectionClient.get_ballot_proofs
+
+    def tampered(self, ballot_indexes, **kwargs):
+        proofs = original(self, ballot_indexes, **kwargs)
+        return {
+            index: bytes([proof[0] ^ 0xFF]) + proof[1:]
+            for index, proof in proofs.items()
+        }
+
+    monkeypatch.setattr(ElectionClient, "get_ballot_proofs", tampered)
+    with pytest.raises(BallotProofError, match="does not match the on-chain commitment"):
+        dep.election.get_all_ballots_with_proofs()

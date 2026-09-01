@@ -63,6 +63,11 @@ services:
       RPC_URL: ${RPC_URL}
       ELECTION_ADDRESS: ${ELECTION_ADDRESS}
       TALLY_POLL_SECONDS: ${TALLY_POLL_SECONDS:-10}
+      # Ballot zkProofs live in VoteSubmitted logs, not contract storage, so
+      # the aggregator recovers them with eth_getLogs. On a public chain a
+      # scan from block 0 will be refused or time out -- set this to the
+      # election's deployment block. 0 is fine for a local devnet.
+      ELECTION_DEPLOY_BLOCK: ${ELECTION_DEPLOY_BLOCK:-0}
       # Needed to trigger each keyper's /decrypt/publish_on_chain once
       # voting ends and the aggregate is published.
       KEYPER_URLS: ${KEYPER_URLS}

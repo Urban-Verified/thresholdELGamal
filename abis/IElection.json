@@ -97,7 +97,7 @@
       {
         "name": "ballot",
         "type": "tuple",
-        "internalType": "struct VotingTypes.Ballot",
+        "internalType": "struct VotingTypes.BallotView",
         "components": [
           {
             "name": "pseudonym",
@@ -127,9 +127,9 @@
             ]
           },
           {
-            "name": "zkProof",
-            "type": "bytes",
-            "internalType": "bytes"
+            "name": "zkProofHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
           },
           {
             "name": "voterSignature",
@@ -165,7 +165,7 @@
       {
         "name": "ballots",
         "type": "tuple[]",
-        "internalType": "struct VotingTypes.Ballot[]",
+        "internalType": "struct VotingTypes.BallotView[]",
         "components": [
           {
             "name": "pseudonym",
@@ -195,9 +195,9 @@
             ]
           },
           {
-            "name": "zkProof",
-            "type": "bytes",
-            "internalType": "bytes"
+            "name": "zkProofHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
           },
           {
             "name": "voterSignature",
@@ -948,6 +948,12 @@
         "type": "uint256",
         "indexed": true,
         "internalType": "uint256"
+      },
+      {
+        "name": "zkProof",
+        "type": "bytes",
+        "indexed": false,
+        "internalType": "bytes"
       }
     ],
     "anonymous": false

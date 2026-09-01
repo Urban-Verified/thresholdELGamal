@@ -66,7 +66,7 @@ from crypto.primitives import (
     g2_to_compressed,
     point_add,
 )
-from eth_client import ElectionClient, EthChain
+from eth_client import BallotProofError, ElectionClient, EthChain
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +97,9 @@ class AggregateResult:
     ballots_admitted: int
     ballots_rejected: int
     rejections: list[dict]
+    ballots_superseded: int
+    superseded: list[dict]
+    voters_counted: int
     candidates: int
 
     def as_dict(self) -> dict:
@@ -156,14 +159,27 @@ def aggregate(
     if n_ballots == 0:
         raise TallyAggregatorError("No ballots on chain")
 
-    ballots = election.get_ballots(0, n_ballots)
+    # Ballot rows come from storage; the zkProof for each comes from its
+    # VoteSubmitted log and is checked against the on-chain commitment. A
+    # missing or mismatched proof aborts the run -- it is never downgraded to
+    # a per-ballot rejection, which would silently drop a valid vote and
+    # publish a wrong tally.
+    from_block = int(os.environ.get(DEPLOY_BLOCK_ENV, "0") or 0)
+    try:
+        ballots = election.get_all_ballots_with_proofs(from_block=from_block)
+    except BallotProofError as e:
+        raise TallyAggregatorError(
+            f"Could not recover ballot proofs from logs: {e}",
+            data={"from_block": from_block, "hint": f"set {DEPLOY_BLOCK_ENV} to the election's deploy block"},
+        ) from e
     c1_acc = [Z2] * num_cand
     c2_acc = [Z2] * num_cand
-    admitted = 0
     rejections: list[dict] = []
+    superseded: list[dict] = []
 
-    for idx, b in enumerate(ballots):
-        ok, reason = sdk_compat.verify_ballot(
+    def _verify(idx: int) -> tuple[bool, str | None]:
+        b = ballots[idx]
+        return sdk_compat.verify_ballot(
             mpk=mpk,
             election_id=election_id_bytes,
             pseudonym=bytes(b["pseudonym"]),
@@ -176,20 +192,67 @@ def aggregate(
             budget=budget,
             verify_wr=verify_wr,
         )
-        if not ok:
-            rejections.append({"ballot_index": idx, "reason": reason})
-            continue
 
+    # ------------------------------------------------------------------
+    #  Re-vote selection: LATEST VALID per pseudonym.
+    #
+    #  The contract appends a ballot record per submission and points
+    #  ballotIndexPlusOneByPseudonym at the newest, so one pseudonym can own
+    #  several ballots. Counting them all would count that voter twice.
+    #
+    #  The rule, which MUST match voting-dashboard's generated
+    #  verify-aggregate.js byte for byte -- otherwise an auditor selects a
+    #  different ballot and computes a different aggregate:
+    #
+    #    for each pseudonym, walk its ballots newest -> oldest and count the
+    #    first that verifies; if none verify, that voter contributes nothing.
+    #
+    #  Ballots older than the selected one are never verified: they are
+    #  superseded regardless of validity. Ballots newer than it were tried and
+    #  failed, so they appear in `rejections` as well as `superseded`.
+    # ------------------------------------------------------------------
+    by_pseudonym: dict[bytes, list[int]] = {}
+    for idx, b in enumerate(ballots):
+        by_pseudonym.setdefault(bytes(b["pseudonym"]), []).append(idx)
+
+    selected: list[int] = []
+    for pseudonym, idxs in by_pseudonym.items():
+        chosen: int | None = None
+        for idx in sorted(idxs, reverse=True):
+            ok, reason = _verify(idx)
+            if ok:
+                chosen = idx
+                break
+            rejections.append({"ballot_index": idx, "reason": reason})
+        if chosen is None:
+            continue
+        selected.append(chosen)
+        # Only ballots OLDER than the counted one are superseded: they were
+        # never verified, because a newer ballot already won. Newer ballots
+        # were tried and failed, so they are rejections -- categorising them
+        # as both would double-count and the three categories would not sum
+        # to the ballot total.
+        for idx in idxs:
+            if idx < chosen:
+                superseded.append({
+                    "ballot_index": idx,
+                    "superseded_by": chosen,
+                    "pseudonym": pseudonym.hex(),
+                })
+
+    for idx in sorted(selected):
+        b = ballots[idx]
         for j in range(num_cand):
             c1 = g2_from_compressed(b["ciphertexts"][j][0])
             c2 = g2_from_compressed(b["ciphertexts"][j][1])
             c1_acc[j] = point_add(c1_acc[j], c1)
             c2_acc[j] = point_add(c2_acc[j], c2)
-        admitted += 1
+    admitted = len(selected)
 
     if admitted == 0:
         raise TallyAggregatorError(
-            "All ballots rejected", data={"rejections": rejections},
+            "No countable ballots: every voter's ballots failed verification",
+            data={"rejections": rejections, "superseded": superseded},
         )
 
     aggregate_bytes = [
@@ -208,6 +271,9 @@ def aggregate(
         ballots_admitted=admitted,
         ballots_rejected=len(rejections),
         rejections=rejections,
+        ballots_superseded=len(superseded),
+        superseded=superseded,
+        voters_counted=len(selected),
         candidates=num_cand,
     )
 
@@ -472,6 +538,11 @@ PRIVATE_KEY_ENV = "TALLY_AGGREGATOR_PRIVATE_KEY"
 RPC_URL_ENV = "RPC_URL"
 ELECTION_ADDRESS_ENV = "ELECTION_ADDRESS"
 POLL_SECONDS_ENV = "TALLY_POLL_SECONDS"
+# Block to start the VoteSubmitted log scan from. Proofs live in logs, not
+# storage, so recovering them means an eth_getLogs range. On a public chain,
+# scanning from 0 will be refused or time out -- set this to the election's
+# deployment block. Default 0 is fine for a local devnet.
+DEPLOY_BLOCK_ENV = "ELECTION_DEPLOY_BLOCK"
 
 
 def _resolve_signer(args) -> LocalAccount:
